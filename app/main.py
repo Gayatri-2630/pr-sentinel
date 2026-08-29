@@ -136,3 +136,4 @@ async def github_webhook(
  
     return {"status": "ignored", "event": x_github_event}
  # Testing incremental code indexing
+# Testing repository indexing authentication
