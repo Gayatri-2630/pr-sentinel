@@ -6,6 +6,7 @@ more than just the diff -- this is the foundation for our RAG pipeline.
 import os
 import pickle
 import shutil
+import stat
  
 import faiss
 import numpy as np
@@ -40,6 +41,16 @@ def _local_path_for_repo(repo_full_name: str) -> str:
     return os.path.join(CLONE_BASE_DIR, safe_name)
  
  
+def _remove_readonly(func, path, _exc_info):
+    """
+    Windows marks git's internal pack files as read-only, which blocks normal
+    deletion. This clears that flag and retries -- a well-known workaround
+    for GitPython + shutil.rmtree on Windows specifically.
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+ 
+ 
 def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: str) -> str:
     """
     Make sure we have a local, up-to-date clone of this repo.
@@ -54,6 +65,8 @@ def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: 
  
     # Inject the installation token into the clone URL so git can
     # authenticate -- GitHub accepts this "x-access-token" format.
+    # Installation tokens expire after about an hour, so we must refresh
+    # this on EVERY call, even for repos we've already cloned before.
     authenticated_url = clone_url.replace(
         "https://", f"https://x-access-token:{installation_token}@"
     )
@@ -61,12 +74,14 @@ def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: 
     if os.path.exists(local_path):
         try:
             repo = Repo(local_path)
+            # Refresh the remote URL with today's token before pulling --
+            # the token saved from the original clone may have expired.
+            repo.remotes.origin.set_url(authenticated_url)
             repo.remotes.origin.pull()
             return local_path
-        except Exception:
-            # If the existing clone is somehow corrupted, wipe it and
-            # start fresh rather than getting stuck in a broken state.
-            shutil.rmtree(local_path)
+        except Exception as e:
+            print(f"Existing clone failed to update ({e}), re-cloning from scratch.")
+            shutil.rmtree(local_path, onerror=_remove_readonly)
  
     os.makedirs(CLONE_BASE_DIR, exist_ok=True)
     Repo.clone_from(authenticated_url, local_path)
@@ -126,6 +141,45 @@ def _index_paths_for_repo(repo_full_name: str) -> tuple[str, str]:
     index_path = os.path.join(INDEX_BASE_DIR, f"{safe_name}.faiss")
     metadata_path = os.path.join(INDEX_BASE_DIR, f"{safe_name}_metadata.pkl")
     return index_path, metadata_path
+ 
+ 
+def index_repository(repo_full_name: str, local_repo_path: str) -> int:
+    """
+    Walk every Python file in a cloned repo, chunk each one, and store all
+    the chunks together as one searchable FAISS index for this repo.
+    Returns the total number of chunks indexed.
+    """
+    # Folders we never want to walk into -- virtual envs, git internals,
+    # and dependency folders would otherwise flood the index with noise
+    # that has nothing to do with the actual project code.
+    SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
+ 
+    all_chunks = []
+ 
+    for root, dirs, files in os.walk(local_repo_path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]  # prune in place, skip descending into them
+ 
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+ 
+            full_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(full_path, local_repo_path)
+ 
+            try:
+                chunks = chunk_python_file(full_path)
+            except Exception as e:
+                # A single unparseable file (e.g. Python 2 syntax, or a
+                # weird encoding) shouldn't crash the whole indexing run.
+                print(f"Skipping {relative_path}, failed to parse: {e}")
+                continue
+ 
+            for chunk in chunks:
+                chunk["file_path"] = relative_path  # so we know WHERE this chunk lives
+            all_chunks.extend(chunks)
+ 
+    embed_and_store_chunks(repo_full_name, all_chunks)
+    return len(all_chunks)
  
  
 def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:

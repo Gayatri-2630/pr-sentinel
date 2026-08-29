@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy.orm import Session
  
 from app import crud, models  # noqa: F401 -- models import registers tables on Base
-from app.code_indexer import ensure_repo_cloned
+from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
@@ -125,6 +125,17 @@ async def github_webhook(
                 installation_token=token,
             )
             logger.info(f"Repo available locally at: {local_repo_path}")
+ 
+            # Incremental indexing: only re-embed the codebase if it's
+            # actually changed since we last indexed it. Comparing commit
+            # SHAs is a cheap, reliable way to know "has anything changed?"
+            head_sha = pr["head"]["sha"]
+            if repository_row.last_indexed_commit_sha == head_sha:
+                logger.info("Repo already indexed at this commit -- skipping re-indexing.")
+            else:
+                chunk_count = index_repository(repo["full_name"], local_repo_path)
+                crud.mark_repository_indexed(db, repository_row, head_sha)
+                logger.info(f"Indexed {chunk_count} code chunks for {repo['full_name']}.")
  
             return {
                 "status": "received",

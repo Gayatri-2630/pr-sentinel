@@ -4,14 +4,14 @@ the webhook handler and the raw SQLAlchemy models. Keeping this separate from
 main.py keeps the webhook handler focused on "what happened" rather than
 "how do I save it."
 """
-
+ 
 from datetime import datetime, timezone
-
+ 
 from sqlalchemy.orm import Session
-
+ 
 from app import models
-
-
+ 
+ 
 def get_or_create_installation(db: Session, github_installation_id: str, account_login: str) -> models.Installation:
     installation = (
         db.query(models.Installation)
@@ -20,7 +20,7 @@ def get_or_create_installation(db: Session, github_installation_id: str, account
     )
     if installation:
         return installation
-
+ 
     installation = models.Installation(
         github_installation_id=str(github_installation_id),
         account_login=account_login,
@@ -29,8 +29,8 @@ def get_or_create_installation(db: Session, github_installation_id: str, account
     db.commit()
     db.refresh(installation)  # pulls back the auto-generated id, so we can use it right away
     return installation
-
-
+ 
+ 
 def get_or_create_repository(
     db: Session, installation_id: int, repo_full_name: str, default_branch: str
 ) -> models.Repository:
@@ -41,7 +41,7 @@ def get_or_create_repository(
     )
     if repository:
         return repository
-
+ 
     repository = models.Repository(
         installation_id=installation_id,
         repo_full_name=repo_full_name,
@@ -51,8 +51,8 @@ def get_or_create_repository(
     db.commit()
     db.refresh(repository)
     return repository
-
-
+ 
+ 
 def create_review(db: Session, repository_id: int, pr_number: int, head_sha: str) -> models.Review:
     review = models.Review(
         repository_id=repository_id,
@@ -65,8 +65,17 @@ def create_review(db: Session, repository_id: int, pr_number: int, head_sha: str
     db.commit()
     db.refresh(review)
     return review
-
-
+ 
+ 
+def mark_repository_indexed(db: Session, repository: models.Repository, commit_sha: str) -> models.Repository:
+    """Record that we've indexed this repo up to a specific commit."""
+    repository.last_indexed_commit_sha = commit_sha
+    repository.indexed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(repository)
+    return repository
+ 
+ 
 def mark_review_completed(db: Session, review: models.Review) -> models.Review:
     review.status = "completed"
     review.completed_at = datetime.now(timezone.utc)
