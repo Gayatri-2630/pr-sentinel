@@ -4,9 +4,13 @@ more than just the diff -- this is the foundation for our RAG pipeline.
 """
  
 import os
+import pickle
 import shutil
  
+import faiss
+import numpy as np
 from git import Repo
+from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
  
@@ -14,6 +18,7 @@ import tree_sitter_python as tspython
 # after its full_name with the slash replaced (GitHub repo names can't
 # contain colons or other path-unsafe characters, so this is safe).
 CLONE_BASE_DIR = "./repo_clones"
+INDEX_BASE_DIR = "./vector_indexes"
  
 # Set up the tree-sitter parser once, at import time, so we don't rebuild
 # it on every single file we parse.
@@ -24,6 +29,10 @@ _parser = Parser(PY_LANGUAGE)
 # Functions and classes are the meaningful units of code most reviewers
 # actually reason about -- not arbitrary line counts.
 CHUNKABLE_NODE_TYPES = {"function_definition", "class_definition"}
+ 
+# A small, fast, free, locally-run embedding model -- no API key or cost.
+# 384-dimensional vectors, good enough for code similarity at this scale.
+_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
  
  
 def _local_path_for_repo(repo_full_name: str) -> str:
@@ -108,3 +117,65 @@ def chunk_python_file(file_path: str) -> list[dict]:
  
     walk(root_node)
     return chunks
+ 
+ 
+def _index_paths_for_repo(repo_full_name: str) -> tuple[str, str]:
+    """Returns (faiss_index_path, metadata_path) for a given repo."""
+    safe_name = repo_full_name.replace("/", "__")
+    os.makedirs(INDEX_BASE_DIR, exist_ok=True)
+    index_path = os.path.join(INDEX_BASE_DIR, f"{safe_name}.faiss")
+    metadata_path = os.path.join(INDEX_BASE_DIR, f"{safe_name}_metadata.pkl")
+    return index_path, metadata_path
+ 
+ 
+def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
+    """
+    Turn a list of code chunks into embeddings and save them in a FAISS
+    index on disk, along with their metadata (name, file, line range) so
+    we can map a search result back to actual readable information.
+    """
+    if not all_chunks:
+        return
+ 
+    code_texts = [chunk["code"] for chunk in all_chunks]
+    embeddings = _embedding_model.encode(code_texts, show_progress_bar=False)
+    embeddings = np.array(embeddings, dtype="float32")
+ 
+    dimension = embeddings.shape[1]  # 384 for this model
+    index = faiss.IndexFlatL2(dimension)  # simple, exact nearest-neighbor search
+    index.add(embeddings)
+ 
+    index_path, metadata_path = _index_paths_for_repo(repo_full_name)
+    faiss.write_index(index, index_path)
+ 
+    with open(metadata_path, "wb") as f:
+        pickle.dump(all_chunks, f)
+ 
+ 
+def search_similar_chunks(repo_full_name: str, query_code: str, top_k: int = 5) -> list[dict]:
+    """
+    Given a piece of code (e.g. from a PR diff), find the most semantically
+    similar chunks already indexed for this repo -- this is the actual
+    'retrieval' in Retrieval-Augmented Generation.
+    """
+    index_path, metadata_path = _index_paths_for_repo(repo_full_name)
+ 
+    if not os.path.exists(index_path):
+        return []  # repo hasn't been indexed yet
+ 
+    index = faiss.read_index(index_path)
+    with open(metadata_path, "rb") as f:
+        all_chunks = pickle.load(f)
+ 
+    query_embedding = _embedding_model.encode([query_code], show_progress_bar=False)
+    query_embedding = np.array(query_embedding, dtype="float32")
+ 
+    distances, indices = index.search(query_embedding, min(top_k, len(all_chunks)))
+ 
+    results = []
+    for idx, distance in zip(indices[0], distances[0]):
+        chunk = all_chunks[idx].copy()
+        chunk["similarity_distance"] = float(distance)  # lower = more similar
+        results.append(chunk)
+ 
+    return results
