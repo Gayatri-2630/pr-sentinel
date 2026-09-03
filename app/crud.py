@@ -76,6 +76,22 @@ def mark_repository_indexed(db: Session, repository: models.Repository, commit_s
     return repository
  
  
+def save_finding(db: Session, review_id: int, finding: dict) -> models.Finding:
+    """Save one agent finding as a real row, linked back to its review."""
+    finding_row = models.Finding(
+        review_id=review_id,
+        agent_type=finding.get("agent_type", "unknown"),
+        file_path=finding.get("file_path", "unknown"),
+        line_number=finding.get("line_number"),
+        severity=finding.get("severity", "low"),
+        message=finding.get("message", ""),
+    )
+    db.add(finding_row)
+    db.commit()
+    db.refresh(finding_row)
+    return finding_row
+ 
+ 
 def mark_review_completed(db: Session, review: models.Review) -> models.Review:
     review.status = "completed"
     review.completed_at = datetime.now(timezone.utc)
