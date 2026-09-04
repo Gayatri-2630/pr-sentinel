@@ -165,3 +165,8 @@ def test_rag_verification():
     password = "my_secret_password"
     query = f"SELECT * FROM users WHERE name = '{password}'"
     return query
+
+def test_rag_verification():
+    password = "my_secret_password"
+    query = f"SELECT * FROM users WHERE name = '{password}'"
+    return query
