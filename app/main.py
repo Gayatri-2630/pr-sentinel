@@ -161,12 +161,6 @@ async def github_webhook(
  
     return {"status": "ignored", "event": x_github_event}
 
-def test_rag_verification():
-    password = "my_secret_password"
-    query = f"SELECT * FROM users WHERE name = '{password}'"
-    return query
-
-def test_rag_verification():
-    password = "my_secret_password"
-    query = f"SELECT * FROM users WHERE name = '{password}'"
+def test_verification():
+    query = "SELECT * FROM users WHERE id = " + user_id
     return query
