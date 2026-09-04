@@ -77,3 +77,4 @@ def verify_finding(diff_text: str, finding: dict) -> dict:
 def verify_all_findings(diff_text: str, findings: list[dict]) -> list[dict]:
     """Run verification on every finding in the list, one at a time."""
     return [verify_finding(diff_text, finding) for finding in findings]
+ 
