@@ -144,9 +144,10 @@ async def github_webhook(
  
             for finding in findings:
                 crud.save_finding(db, review_id=review_row.id, finding=finding)
+                verified_tag = "VERIFIED" if finding.get("verified") else "UNVERIFIED"
                 logger.info(
                     f"  [{finding['agent_type'].upper()}] [{finding['severity'].upper()}] "
-                    f"{finding['file_path']}: {finding['message']}"
+                    f"[{verified_tag}] {finding['file_path']}: {finding['message']}"
                 )
  
             return {
@@ -159,3 +160,8 @@ async def github_webhook(
             }
  
     return {"status": "ignored", "event": x_github_event}
+
+def test_rag_verification():
+    password = "my_secret_password"
+    query = f"SELECT * FROM users WHERE name = '{password}'"
+    return query

@@ -85,6 +85,8 @@ def save_finding(db: Session, review_id: int, finding: dict) -> models.Finding:
         line_number=finding.get("line_number"),
         severity=finding.get("severity", "low"),
         message=finding.get("message", ""),
+        verified=finding.get("verified", False),
+        false_positive_flag=not finding.get("verified", False),
     )
     db.add(finding_row)
     db.commit()
@@ -102,3 +104,4 @@ def mark_review_completed(db: Session, review: models.Review) -> models.Review:
     db.commit()
     db.refresh(review)
     return review
+ 
