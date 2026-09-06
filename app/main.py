@@ -156,7 +156,10 @@ async def github_webhook(
             usage_records = get_and_clear_usage_log()
             for usage in usage_records:
                 crud.save_llm_usage(db, review_id=review_row.id, usage=usage)
-            total_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usage_records)
+            total_tokens = sum(
+                (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+                for u in usage_records
+)
             logger.info(f"Logged {len(usage_records)} LLM calls, {total_tokens} total tokens.")
  
             crud.mark_review_completed(db, review_row)
