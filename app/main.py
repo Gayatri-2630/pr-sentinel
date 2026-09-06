@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy.orm import Session
  
 from app import crud, models  # noqa: F401 -- models import registers tables on Base
+from app.agents.orchestrator import run_all_agents
 from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
@@ -137,12 +138,25 @@ async def github_webhook(
                 crud.mark_repository_indexed(db, repository_row, head_sha)
                 logger.info(f"Indexed {chunk_count} code chunks for {repo['full_name']}.")
  
+            # Run the actual AI analysis: all three agents on this diff.
+            findings = run_all_agents(diff_text)
+            logger.info(f"Agents produced {len(findings)} findings.")
+ 
+            for finding in findings:
+                crud.save_finding(db, review_id=review_row.id, finding=finding)
+                verified_tag = "VERIFIED" if finding.get("verified") else "UNVERIFIED"
+                logger.info(
+                    f"  [{finding['agent_type'].upper()}] [{finding['severity'].upper()}] "
+                    f"[{verified_tag}] {finding['file_path']}: {finding['message']}"
+                )
+ 
             return {
                 "status": "received",
                 "pr_number": pr["number"],
                 "action": action,
                 "diff_length": len(diff_text),
                 "review_id": review_row.id,
+                "findings_count": len(findings),
             }
  
     return {"status": "ignored", "event": x_github_event}
