@@ -56,7 +56,7 @@ def verify_finding(diff_text: str, finding: dict) -> dict:
     )
  
     try:
-        raw_response = call_llm(prompt)
+        raw_response = call_llm(prompt, agent_type="verifier")
         result = json.loads(raw_response)
  
         # Gemini sometimes wraps the answer in a list (e.g. [{"verified": true, ...}])

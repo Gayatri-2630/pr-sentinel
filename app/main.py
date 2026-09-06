@@ -13,6 +13,7 @@ from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
+from app.llm_client import get_and_clear_usage_log
  
 load_dotenv()
  
@@ -50,8 +51,8 @@ def verify_signature(payload_body: bytes, signature_header: str | None) -> bool:
  
  
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health_check():
+    return {"status": "healthy"}
  
  
 @app.post("/webhook")
@@ -109,12 +110,12 @@ async def github_webhook(
                 pr_number=pr["number"],
                 head_sha=pr["head"]["sha"],
             )
-            crud.mark_review_completed(db, review_row)
- 
-            logger.info(
-                f"Saved review id={review_row.id} for PR #{pr['number']} "
-                f"(latency: {review_row.total_latency_ms}ms)"
-            )
+            # NOTE: mark_review_completed() is called at the END of this
+            # function now, once indexing + all agent analysis is actually
+            # done -- calling it here (right after creation) was a bug that
+            # made total_latency_ms record only a few milliseconds instead
+            # of the real end-to-end pipeline time.
+            logger.info(f"Saved review id={review_row.id} for PR #{pr['number']}")
  
             # Clone (or update) a local copy of the repo, so we have more
             # than just the diff to work with -- this is the foundation
@@ -150,6 +151,16 @@ async def github_webhook(
                     f"[{verified_tag}] {finding['file_path']}: {finding['message']}"
                 )
  
+            # Save every LLM call's token/latency stats made during this
+            # run -- collected centrally in llm_client, saved here per review.
+            usage_records = get_and_clear_usage_log()
+            for usage in usage_records:
+                crud.save_llm_usage(db, review_id=review_row.id, usage=usage)
+            total_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usage_records)
+            logger.info(f"Logged {len(usage_records)} LLM calls, {total_tokens} total tokens.")
+ 
+            crud.mark_review_completed(db, review_row)
+ 
             return {
                 "status": "received",
                 "pr_number": pr["number"],
@@ -160,3 +171,4 @@ async def github_webhook(
             }
  
     return {"status": "ignored", "event": x_github_event}
+ 

@@ -94,6 +94,23 @@ def save_finding(db: Session, review_id: int, finding: dict) -> models.Finding:
     return finding_row
  
  
+def save_llm_usage(db: Session, review_id: int, usage: dict) -> models.LLMUsage:
+    """Save one LLM call's usage stats, linked back to its review."""
+    usage_row = models.LLMUsage(
+        review_id=review_id,
+        agent_type=usage.get("agent_type", "unknown"),
+        model=usage.get("model", "unknown"),
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cost_estimate=usage.get("cost_estimate", 0.0),
+        latency_ms=usage.get("latency_ms"),
+    )
+    db.add(usage_row)
+    db.commit()
+    db.refresh(usage_row)
+    return usage_row
+ 
+ 
 def mark_review_completed(db: Session, review: models.Review) -> models.Review:
     review.status = "completed"
     review.completed_at = datetime.now(timezone.utc)
