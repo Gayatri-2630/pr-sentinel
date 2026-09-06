@@ -160,7 +160,6 @@ async def github_webhook(
             }
  
     return {"status": "ignored", "event": x_github_event}
-
 def test_verification(user_id):
     query = "SELECT * FROM users WHERE id = " + user_id
     return query
