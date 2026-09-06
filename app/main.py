@@ -52,6 +52,7 @@ def verify_signature(payload_body: bytes, signature_header: str | None) -> bool:
  
 @app.get("/health")
 def health_check():
+    """Return the health status of the API."""
     return {"status": "healthy"}
  
  
