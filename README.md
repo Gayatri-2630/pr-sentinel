@@ -61,4 +61,3 @@ installations, repos, reviews, findings, LLM usage, and evaluation runs.
 - ⬜ Observability dashboard (Week 6)
 - ⬜ Evaluation + ablation study (Week 7)
 - ⬜ Docs, diagrams, demo video (Week 8)
-Incremental indexing verification test.
