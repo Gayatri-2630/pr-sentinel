@@ -1,23 +1,26 @@
 """
 Orchestrator for PR Sentinel's multi-agent analysis layer.
  
-Runs the Security, Logic, and Style agents on the same diff, tags each
-finding with which agent produced it, and merges everything into one
-combined list. This is the single entry point main.py will call, instead
-of calling each agent separately.
+Runs the Security, Logic, and Style AI agents PLUS deterministic static
+analysis tools (bandit, pylint) on the same diff/repo, tags every finding
+with its source, merges everything into one combined list, then runs the
+self-verification pass on top. This is the "hybrid AI + static analysis"
+design: AI catches context-dependent issues, static tools catch known,
+well-defined patterns with zero hallucination risk.
 """
  
 from app.agents.logic_agent import run_logic_agent
 from app.agents.security_agent import run_security_agent
 from app.agents.style_agent import run_style_agent
 from app.agents.verifier import verify_all_findings
+from app.static_analysis import run_bandit, run_pylint
  
  
-def run_all_agents(diff_text: str) -> list[dict]:
+def run_all_agents(diff_text: str, repo_path: str = None) -> list[dict]:
     """
-    Run all three agents on the same diff, tag and merge their findings,
-    then run every finding through the self-verification pass before
-    returning them.
+    Run all three AI agents on the diff, plus bandit/pylint on the full
+    repo if a local path is given, tag and merge everything, then verify
+    every finding before returning them.
     """
     agent_runs = [
         ("security", run_security_agent),
@@ -31,8 +34,6 @@ def run_all_agents(diff_text: str) -> list[dict]:
         try:
             findings = agent_function(diff_text)
         except Exception as e:
-            # One agent failing (e.g. a transient API error) shouldn't
-            # take down the other two -- log it and keep going.
             print(f"{agent_type} agent failed with an error: {e}")
             findings = []
  
@@ -40,6 +41,15 @@ def run_all_agents(diff_text: str) -> list[dict]:
             finding["agent_type"] = agent_type
  
         all_findings.extend(findings)
+ 
+    if repo_path:
+        for tool_name, tool_function in [("bandit", run_bandit), ("pylint", run_pylint)]:
+            try:
+                tool_findings = tool_function(repo_path)
+            except Exception as e:
+                print(f"{tool_name} failed with an error: {e}")
+                tool_findings = []
+            all_findings.extend(tool_findings)
  
     verified_findings = verify_all_findings(diff_text, all_findings)
     return verified_findings
