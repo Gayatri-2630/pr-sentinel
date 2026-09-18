@@ -139,7 +139,7 @@ async def github_webhook(
                 logger.info(f"Indexed {chunk_count} code chunks for {repo['full_name']}.")
  
             # Run the actual AI analysis: all three agents on this diff.
-            findings = run_all_agents(diff_text)
+            findings = run_all_agents(diff_text, repo_path=local_repo_path)
             logger.info(f"Agents produced {len(findings)} findings.")
  
             for finding in findings:
