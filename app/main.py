@@ -13,6 +13,8 @@ from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
+from app.llm_client import get_and_clear_usage_log
+from app.security_filters import redact_secrets
  
 load_dotenv()
  
@@ -87,6 +89,7 @@ async def github_webhook(
                 repo_full_name=repo["full_name"],
                 pr_number=pr["number"],
             )
+            diff_text = redact_secrets(diff_text)
  
             logger.info(f"Fetched diff, {len(diff_text)} characters:")
             logger.info(diff_text[:500])  # just the first 500 chars for now, to keep logs readable

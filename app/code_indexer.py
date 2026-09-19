@@ -14,6 +14,28 @@ from git import Repo
 from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
+# Files matching these patterns are NEVER indexed, embedded, or sent to
+# any LLM -- even if they somehow end up in a repo. This protects against
+# accidentally leaking real secrets to a third-party API.
+SENSITIVE_FILE_PATTERNS = [
+    ".env",
+    ".pem",
+    "credentials.json",
+    "id_rsa",
+    "id_ed25519",
+    ".pfx",
+    ".p12",
+    "secrets.yml",
+    "secrets.yaml",
+    ".npmrc",
+    ".pypirc",
+]
+
+
+def is_sensitive_file(file_path: str) -> bool:
+    """Check if a file path matches any known sensitive-file pattern."""
+    file_path_lower = file_path.lower()
+    return any(pattern in file_path_lower for pattern in SENSITIVE_FILE_PATTERNS)
  
 # Where we'll keep local clones. Each repo gets its own subfolder, named
 # after its full_name with the slash replaced (GitHub repo names can't
@@ -165,6 +187,10 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
  
             full_path = os.path.join(root, filename)
             relative_path = os.path.relpath(full_path, local_repo_path)
+            if is_sensitive_file(relative_path):
+                print(f"Skipping sensitive file, not indexing: {relative_path}")
+
+                continue
  
             try:
                 chunks = chunk_python_file(full_path)
