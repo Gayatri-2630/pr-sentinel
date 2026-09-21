@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import logging
 import os
- 
+# Static analysis verification test
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -13,7 +13,6 @@ from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
-from app.llm_client import get_and_clear_usage_log
 from app.security_filters import redact_secrets
  
 load_dotenv()
