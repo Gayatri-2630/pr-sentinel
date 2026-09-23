@@ -1,29 +1,20 @@
 """
-Runs deterministic static analysis tools (Bandit and Pylint) against a
-cloned repository and converts their output into the same finding-dict
-shape used by the AI agents.
-
-Bandit is run recursively over the repository's app directory.
-
-Pylint is intentionally run one Python file at a time. Running Pylint
-against the entire directory recursively can become extremely slow or
-hang on Windows when the analyzed project contains heavy dependencies.
-Per-file execution keeps the analysis deterministic and lets us identify
-exactly which file causes a problem.
+Runs real, deterministic static analysis tools (bandit, pylint) against a
+cloned repo, and converts their output into the same finding-dict shape
+our AI agents use -- so everything flows through the same save/display
+pipeline regardless of whether an LLM or a fixed-rule tool produced it.
 """
-
+ 
 import json
 import os
 import subprocess
-
-
+ 
 BANDIT_SEVERITY_MAP = {
     "LOW": "low",
     "MEDIUM": "medium",
     "HIGH": "high",
 }
-
-
+ 
 PYLINT_SEVERITY_MAP = {
     "fatal": "critical",
     "error": "high",
@@ -31,166 +22,123 @@ PYLINT_SEVERITY_MAP = {
     "convention": "low",
     "refactor": "low",
 }
-
-
-def _get_target_path(repo_path: str) -> str:
-    """Return the app directory when it exists, otherwise the repo root."""
-    target_path = os.path.join(repo_path, "app")
-
-    if os.path.exists(target_path):
-        return target_path
-
-    return repo_path
-
-
+ 
+ 
 def run_bandit(repo_path: str) -> list[dict]:
     """
-    Run Bandit against the cloned repository.
-
-    Returns findings in the standard finding-dict shape.
-    Fails safely if Bandit cannot be executed or its output cannot
-    be parsed.
+    Run bandit against a cloned repo's code and return findings in our
+    standard dict shape. Fails safe -- returns [] rather than crashing
+    the pipeline if anything goes wrong.
     """
-    target_path = _get_target_path(repo_path)
-
+    target_path = os.path.join(repo_path, "app")
+    if not os.path.exists(target_path):
+        target_path = repo_path
+ 
     try:
+        # check=False: bandit's own exit code is non-zero when it FINDS
+        # issues -- that's expected, not a failure, so we don't want
+        # subprocess to raise on that. Fixed, hardcoded command list
+        # (no user input reaches this call), so injection risk is not
+        # applicable here despite what a generic linter rule assumes.
         result = subprocess.run(
-            [
-                "bandit",
-                "-r",
-                target_path,
-                "-f",
-                "json",
-            ],
+            ["bandit", "-r", target_path, "-f", "json"],
             capture_output=True,
             text=True,
             timeout=60,
+            check=False,
         )
-
         data = json.loads(result.stdout) if result.stdout.strip() else {}
-
-    except (
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        FileNotFoundError,
-    ) as error:
-        print(f"Bandit run failed, skipping: {error}")
-        return []
-
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Bandit run failed, skipping: {e}")
+        return [{
+            "agent_type": "static_analysis_bandit",
+            "file_path": target_path,
+            "line_number": None,
+            "severity": "low",
+            "message": f"Bandit could not complete: {e}",
+        }]
+ 
     findings = []
-
     for issue in data.get("results", []):
-        findings.append(
-            {
-                "agent_type": "static_analysis_bandit",
-                "file_path": issue.get("filename", "unknown"),
-                "line_number": issue.get("line_number"),
-                "severity": BANDIT_SEVERITY_MAP.get(
-                    issue.get("issue_severity", "LOW"),
-                    "low",
-                ),
-                "message": (
-                    f"[{issue.get('test_id')}] "
-                    f"{issue.get('issue_text', '')}"
-                ),
-            }
-        )
-
+        findings.append({
+            "agent_type": "static_analysis_bandit",
+            "file_path": issue.get("filename", "unknown"),
+            "line_number": issue.get("line_number"),
+            "severity": BANDIT_SEVERITY_MAP.get(issue.get("issue_severity", "LOW"), "low"),
+            "message": f"[{issue.get('test_id')}] {issue.get('issue_text', '')}",
+        })
+ 
     return findings
-
-
-def _get_python_files(target_path: str) -> list[str]:
-    """Return all Python files under the target directory."""
-    python_files = []
-
-    for root, _, files in os.walk(target_path):
-        for filename in files:
-            if filename.endswith(".py"):
-                python_files.append(
-                    os.path.join(root, filename)
-                )
-
-    return sorted(python_files)
-
-
+ 
+ 
 def run_pylint(repo_path: str) -> list[dict]:
     """
-    Run Pylint one Python file at a time.
-
-    This avoids the long-running/hanging behavior observed when Pylint
-    recursively analyzes the entire application directory on Windows.
-
-    Each file has its own timeout. A problematic file is reported as a
-    static-analysis execution error rather than being silently treated
-    as zero findings.
+    Run pylint against a cloned repo's code and return findings in our
+    standard dict shape.
+ 
+    Important flags, and why:
+    - --disable=import-error: pylint otherwise tries to IMPORT the code it
+      analyzes, which loads heavy deps (torch, sentence-transformers, faiss)
+      and caused multi-minute hangs on Windows. We only want static text
+      analysis here, not runtime imports.
+    - no --jobs: parallel mode has a known hang issue on Windows.
+ 
+    If pylint times out, we don't silently return an empty list -- we
+    return an explicit diagnostic finding, so a timeout is visible in the
+    review rather than looking indistinguishable from "no issues found."
     """
-    target_path = _get_target_path(repo_path)
-    python_files = _get_python_files(target_path)
-
-    if not python_files:
-        print("Pylint: no Python files found.")
-        return []
-
+    target_path = os.path.join(repo_path, "app")
+    if not os.path.exists(target_path):
+        target_path = repo_path
+ 
+    try:
+        result = subprocess.run(
+            [
+                "pylint",
+                target_path,
+                "--output-format=json",
+                "--recursive=y",
+                "--disable=import-error",
+                "--persistent=n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        data = json.loads(result.stdout) if result.stdout.strip() else []
+    except subprocess.TimeoutExpired:
+        print(f"Pylint timed out after 120s scanning {target_path}")
+        return [{
+            "agent_type": "static_analysis_pylint",
+            "file_path": target_path,
+            "line_number": None,
+            "severity": "low",
+            "message": "Pylint timed out after 120s -- results incomplete for this run, not a clean pass.",
+        }]
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Pylint run failed, skipping: {e}")
+        return [{
+            "agent_type": "static_analysis_pylint",
+            "file_path": target_path,
+            "line_number": None,
+            "severity": "low",
+            "message": f"Pylint could not complete: {e}",
+        }]
+ 
     findings = []
-
-    print(f"Pylint: analyzing {len(python_files)} Python files...")
-
-    for file_path in python_files:
-        try:
-            result = subprocess.run(
-                [
-                    "pylint",
-                    file_path,
-                    "--output-format=json",
-                    "--persistent=n",
-                    "--disable=import-error",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-
-            if not result.stdout.strip():
-                continue
-
-            data = json.loads(result.stdout)
-
-        except subprocess.TimeoutExpired:
-            print(
-                f"Pylint timed out for file: {file_path}"
-            )
-            continue
-
-        except json.JSONDecodeError as error:
-            print(
-                f"Pylint returned invalid JSON for {file_path}: "
-                f"{error}"
-            )
-            continue
-
-        except FileNotFoundError as error:
-            print(f"Pylint executable not found: {error}")
-            return []
-
-        for issue in data:
-            findings.append(
-                {
-                    "agent_type": "static_analysis_pylint",
-                    "file_path": issue.get("path", file_path),
-                    "line_number": issue.get("line"),
-                    "severity": PYLINT_SEVERITY_MAP.get(
-                        issue.get("type", "convention"),
-                        "low",
-                    ),
-                    "message": (
-                        f"[{issue.get('symbol')}] "
-                        f"{issue.get('message', '')}"
-                    ),
-                }
-            )
+    for issue in data:
+        findings.append({
+            "agent_type": "static_analysis_pylint",
+            "file_path": issue.get("path", "unknown"),
+            "line_number": issue.get("line"),
+            "severity": PYLINT_SEVERITY_MAP.get(issue.get("type", "convention"), "low"),
+            "message": f"[{issue.get('symbol')}] {issue.get('message', '')}",
+        })
+ 
     # Pylint is noisy by default (whitespace, missing docstrings, etc.)
     # Filter to medium-severity-and-above only, so this doesn't drown
     # out genuinely important findings with pure style nitpicks.
     findings = [f for f in findings if f["severity"] in ("medium", "high", "critical")]
-
+ 
     return findings
