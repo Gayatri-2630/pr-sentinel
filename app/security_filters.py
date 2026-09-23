@@ -10,10 +10,14 @@ import re
  
 # Each pattern matches a common, recognizable secret FORMAT (not just a
 # suspicious variable name) -- reduces false positives on normal code.
+# Note: open-ended quantifiers ({30,}, not a fixed {36}) are deliberate --
+# a fixed length can leave a trailing fragment of the real secret visible
+# if the actual token is longer than expected. Always match greedily to
+# the full token.
 SECRET_PATTERNS = [
     (r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY"),                          # AWS access key ID
     (r"sk-[a-zA-Z0-9]{20,}", "API_KEY_SK_PREFIX"),                    # OpenAI/Stripe-style sk- keys
-    (r"ghp_[a-zA-Z0-9]{30,}", "GITHUB_TOKEN"),                         # GitHub personal access token
+    (r"ghp_[a-zA-Z0-9]{30,}", "GITHUB_TOKEN"),                        # GitHub personal access token
     (r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}", "JWT_TOKEN"),  # JWTs
     (r"-----BEGIN (RSA |EC )?PRIVATE KEY-----", "PRIVATE_KEY_BLOCK"),  # PEM private key headers
 ]

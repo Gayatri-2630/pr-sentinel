@@ -2,17 +2,18 @@ import hashlib
 import hmac
 import logging
 import os
-# Static analysis verification test
+ 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy.orm import Session
  
-from app import crud, models  # noqa: F401 -- models import registers tables on Base
+from app import crud, models  # pylint: disable=unused-import  # noqa: F401 -- models import registers tables on Base
 from app.agents.orchestrator import run_all_agents
 from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
+from app.llm_client import get_and_clear_usage_log
 from app.security_filters import redact_secrets
  
 load_dotenv()
@@ -69,7 +70,7 @@ async def github_webhook(
         raise HTTPException(status_code=401, detail="Invalid signature")
  
     payload = await request.json()
-    logger.info(f"Verified GitHub event received: {x_github_event}")
+    logger.info("Verified GitHub event received: %s", x_github_event)
  
     if x_github_event == "pull_request":
         action = payload.get("action")
@@ -79,8 +80,8 @@ async def github_webhook(
             installation_id = payload["installation"]["id"]
  
             logger.info(
-                f"PR #{pr['number']} ({action}) on {repo['full_name']} "
-                f"-- head sha {pr['head']['sha'][:8]}"
+                "PR #%s (%s) on %s -- head sha %s",
+                pr["number"], action, repo["full_name"], pr["head"]["sha"][:8],
             )
  
             diff_text = get_pr_diff(
@@ -90,7 +91,7 @@ async def github_webhook(
             )
             diff_text = redact_secrets(diff_text)
  
-            logger.info(f"Fetched diff, {len(diff_text)} characters:")
+            logger.info("Fetched diff, %s characters:", len(diff_text))
             logger.info(diff_text[:500])  # just the first 500 chars for now, to keep logs readable
  
             # Save everything to Postgres so this event has a permanent record.
@@ -111,46 +112,60 @@ async def github_webhook(
                 pr_number=pr["number"],
                 head_sha=pr["head"]["sha"],
             )
-            crud.mark_review_completed(db, review_row)
- 
-            logger.info(
-                f"Saved review id={review_row.id} for PR #{pr['number']} "
-                f"(latency: {review_row.total_latency_ms}ms)"
-            )
+            logger.info("Saved review id=%s for PR #%s", review_row.id, pr["number"])
  
             # Clone (or update) a local copy of the repo, so we have more
-            # than just the diff to work with -- this is the foundation
-            # for RAG context in the coming steps.
+            # than just the diff to work with.
             token = get_installation_token(installation_id)
             local_repo_path = ensure_repo_cloned(
                 repo_full_name=repo["full_name"],
                 clone_url=repo["clone_url"],
                 installation_token=token,
             )
-            logger.info(f"Repo available locally at: {local_repo_path}")
+            logger.info("Repo available locally at: %s", local_repo_path)
  
             # Incremental indexing: only re-embed the codebase if it's
-            # actually changed since we last indexed it. Comparing commit
-            # SHAs is a cheap, reliable way to know "has anything changed?"
+            # actually changed since we last indexed it.
             head_sha = pr["head"]["sha"]
             if repository_row.last_indexed_commit_sha == head_sha:
                 logger.info("Repo already indexed at this commit -- skipping re-indexing.")
             else:
                 chunk_count = index_repository(repo["full_name"], local_repo_path)
                 crud.mark_repository_indexed(db, repository_row, head_sha)
-                logger.info(f"Indexed {chunk_count} code chunks for {repo['full_name']}.")
+                logger.info("Indexed %s code chunks for %s.", chunk_count, repo["full_name"])
  
-            # Run the actual AI analysis: all three agents on this diff.
-            findings = run_all_agents(diff_text, repo_path=local_repo_path)
-            logger.info(f"Agents produced {len(findings)} findings.")
+            # Run the actual analysis: AI agents + static analysis tools.
+            findings, ai_status = run_all_agents(diff_text, repo_path=local_repo_path)
+            logger.info("Agents produced %s findings.", len(findings))
+ 
+            # Make AI availability explicit and visible, not just buried
+            # in earlier log lines -- static analysis should be seen as
+            # fully working even when the AI layer isn't available.
+            logger.info("=" * 50)
+            logger.info("AI analysis status:")
+            for agent_name, status in ai_status.items():
+                symbol = "OK" if status == "ok" else "UNAVAILABLE"
+                logger.info("  [%s] %s: %s", symbol, agent_name, status)
+            logger.info("Static analysis: bandit + pylint always attempted.")
+            logger.info("=" * 50)
  
             for finding in findings:
                 crud.save_finding(db, review_id=review_row.id, finding=finding)
                 verified_tag = "VERIFIED" if finding.get("verified") else "UNVERIFIED"
                 logger.info(
-                    f"  [{finding['agent_type'].upper()}] [{finding['severity'].upper()}] "
-                    f"[{verified_tag}] {finding['file_path']}: {finding['message']}"
+                    "  [%s] [%s] [%s] %s: %s",
+                    finding["agent_type"].upper(), finding["severity"].upper(),
+                    verified_tag, finding["file_path"], finding["message"],
                 )
+ 
+            # Save every LLM call's token/latency stats made during this run.
+            usage_records = get_and_clear_usage_log()
+            for usage in usage_records:
+                crud.save_llm_usage(db, review_id=review_row.id, usage=usage)
+            total_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usage_records)
+            logger.info("Logged %s LLM calls, %s total tokens.", len(usage_records), total_tokens)
+ 
+            crud.mark_review_completed(db, review_row)
  
             return {
                 "status": "received",
@@ -159,13 +174,7 @@ async def github_webhook(
                 "diff_length": len(diff_text),
                 "review_id": review_row.id,
                 "findings_count": len(findings),
+                "ai_status": ai_status,
             }
  
     return {"status": "ignored", "event": x_github_event}
-
-# Static analysis E2E trigger
-# Static analysis E2E trigger
-
-# Static analysis E2E trigger
-
-# Static analysis E2E trigger
