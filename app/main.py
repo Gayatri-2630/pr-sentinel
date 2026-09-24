@@ -4,17 +4,12 @@ import logging
 import os
  
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy.orm import Session
  
 from app import crud, models  # pylint: disable=unused-import  # noqa: F401 -- models import registers tables on Base
-from app.agents.orchestrator import run_all_agents
-from app.code_indexer import ensure_repo_cloned, index_repository
 from app.database import Base, engine, get_db
-from app.github_api import get_pr_diff
-from app.github_auth import get_installation_token
-from app.llm_client import get_and_clear_usage_log
-from app.security_filters import redact_secrets
+from app.review_pipeline import process_pr_event
  
 load_dotenv()
  
@@ -56,9 +51,45 @@ def health():
     return {"status": "ok"}
  
  
+@app.get("/reviews/{review_id}")
+def get_review_status(review_id: int, db: Session = Depends(get_db)):
+    """
+    Job-status endpoint: lets you check on a review's progress without
+    needing to watch server logs. Genuinely useful now that reviews run
+    in the background instead of blocking the webhook response.
+    """
+    review = crud.get_review_by_id(db, review_id)
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+ 
+    findings = [
+        {
+            "agent_type": f.agent_type,
+            "severity": f.severity,
+            "file_path": f.file_path,
+            "line_number": f.line_number,
+            "message": f.message,
+            "verified": f.verified,
+        }
+        for f in review.findings
+    ]
+ 
+    return {
+        "review_id": review.id,
+        "pr_number": review.pr_number,
+        "status": review.status,
+        "started_at": review.started_at,
+        "completed_at": review.completed_at,
+        "total_latency_ms": review.total_latency_ms,
+        "findings_count": len(findings),
+        "findings": findings,
+    }
+ 
+ 
 @app.post("/webhook")
 async def github_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_hub_signature_256: str | None = Header(default=None),
     x_github_event: str | None = Header(default=None),
     db: Session = Depends(get_db),
@@ -80,21 +111,13 @@ async def github_webhook(
             installation_id = payload["installation"]["id"]
  
             logger.info(
-                "PR #%s (%s) on %s -- head sha %s",
+                "PR #%s (%s) on %s -- head sha %s -- queuing for background processing",
                 pr["number"], action, repo["full_name"], pr["head"]["sha"][:8],
             )
  
-            diff_text = get_pr_diff(
-                installation_id=installation_id,
-                repo_full_name=repo["full_name"],
-                pr_number=pr["number"],
-            )
-            diff_text = redact_secrets(diff_text)
- 
-            logger.info("Fetched diff, %s characters:", len(diff_text))
-            logger.info(diff_text[:500])  # just the first 500 chars for now, to keep logs readable
- 
-            # Save everything to Postgres so this event has a permanent record.
+            # Only the fast, essential DB writes happen synchronously here.
+            # Everything slow (diff fetch, cloning, indexing, AI agents,
+            # static analysis) is handed off to the background task below.
             installation_row = crud.get_or_create_installation(
                 db,
                 github_installation_id=installation_id,
@@ -112,69 +135,29 @@ async def github_webhook(
                 pr_number=pr["number"],
                 head_sha=pr["head"]["sha"],
             )
-            logger.info("Saved review id=%s for PR #%s", review_row.id, pr["number"])
+            logger.info("Created review id=%s with status 'pending' for PR #%s", review_row.id, pr["number"])
  
-            # Clone (or update) a local copy of the repo, so we have more
-            # than just the diff to work with.
-            token = get_installation_token(installation_id)
-            local_repo_path = ensure_repo_cloned(
+            background_tasks.add_task(
+                process_pr_event,
+                review_id=review_row.id,
+                repository_id=repository_row.id,
+                installation_id=installation_id,
                 repo_full_name=repo["full_name"],
                 clone_url=repo["clone_url"],
-                installation_token=token,
+                default_branch=repo.get("default_branch", "main"),
+                pr_number=pr["number"],
+                head_sha=pr["head"]["sha"],
             )
-            logger.info("Repo available locally at: %s", local_repo_path)
  
-            # Incremental indexing: only re-embed the codebase if it's
-            # actually changed since we last indexed it.
-            head_sha = pr["head"]["sha"]
-            if repository_row.last_indexed_commit_sha == head_sha:
-                logger.info("Repo already indexed at this commit -- skipping re-indexing.")
-            else:
-                chunk_count = index_repository(repo["full_name"], local_repo_path)
-                crud.mark_repository_indexed(db, repository_row, head_sha)
-                logger.info("Indexed %s code chunks for %s.", chunk_count, repo["full_name"])
- 
-            # Run the actual analysis: AI agents + static analysis tools.
-            findings, ai_status = run_all_agents(diff_text, repo_path=local_repo_path)
-            logger.info("Agents produced %s findings.", len(findings))
- 
-            # Make AI availability explicit and visible, not just buried
-            # in earlier log lines -- static analysis should be seen as
-            # fully working even when the AI layer isn't available.
-            logger.info("=" * 50)
-            logger.info("AI analysis status:")
-            for agent_name, status in ai_status.items():
-                symbol = "OK" if status == "ok" else "UNAVAILABLE"
-                logger.info("  [%s] %s: %s", symbol, agent_name, status)
-            logger.info("Static analysis: bandit + pylint always attempted.")
-            logger.info("=" * 50)
- 
-            for finding in findings:
-                crud.save_finding(db, review_id=review_row.id, finding=finding)
-                verified_tag = "VERIFIED" if finding.get("verified") else "UNVERIFIED"
-                logger.info(
-                    "  [%s] [%s] [%s] %s: %s",
-                    finding["agent_type"].upper(), finding["severity"].upper(),
-                    verified_tag, finding["file_path"], finding["message"],
-                )
- 
-            # Save every LLM call's token/latency stats made during this run.
-            usage_records = get_and_clear_usage_log()
-            for usage in usage_records:
-                crud.save_llm_usage(db, review_id=review_row.id, usage=usage)
-            total_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usage_records)
-            logger.info("Logged %s LLM calls, %s total tokens.", len(usage_records), total_tokens)
- 
-            crud.mark_review_completed(db, review_row)
- 
+            # Respond to GitHub immediately -- the slow work above runs
+            # AFTER this response is sent, not before it.
             return {
-                "status": "received",
+                "status": "queued",
                 "pr_number": pr["number"],
                 "action": action,
-                "diff_length": len(diff_text),
                 "review_id": review_row.id,
-                "findings_count": len(findings),
-                "ai_status": ai_status,
+                "check_status_at": f"/reviews/{review_row.id}",
             }
  
     return {"status": "ignored", "event": x_github_event}
+ 
