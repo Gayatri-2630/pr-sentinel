@@ -59,7 +59,7 @@ DIFF:
 def run_logic_agent(diff_text: str) -> list[dict]:
     prompt = LOGIC_PROMPT_TEMPLATE.format(diff_text=diff_text)
 
-    raw_response = call_llm(prompt)
+    raw_response = call_llm(prompt, agent_type="logic")
 
     try:
         findings = json.loads(raw_response)

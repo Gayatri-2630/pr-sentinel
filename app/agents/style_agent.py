@@ -61,7 +61,7 @@ DIFF:
 def run_style_agent(diff_text: str) -> list[dict]:
     prompt = STYLE_PROMPT_TEMPLATE.format(diff_text=diff_text)
 
-    raw_response = call_llm(prompt)
+    raw_response = call_llm(prompt, agent_type="style")
 
     try:
         findings = json.loads(raw_response)
