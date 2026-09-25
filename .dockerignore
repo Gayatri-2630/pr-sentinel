@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+*.pem
+repo_clones/
+vector_indexes/
+*.db
+test_*.py
