@@ -25,6 +25,15 @@ REQUEST_TIMEOUT_SECONDS = 10
  
  
 def _load_private_key() -> str:
+    """
+    Prefer reading the key directly from an environment variable -- this
+    is how we'll run in production (Render's free tier doesn't support
+    mounting secret files). Falls back to reading from a file path for
+    local development, where the .pem file already exists on disk.
+    """
+    key_from_env = os.getenv("GITHUB_PRIVATE_KEY_PEM")
+    if key_from_env:
+        return key_from_env.replace("\\n", "\n")
     with open(GITHUB_PRIVATE_KEY_PATH, "r", encoding="utf-8") as key_file:
         return key_file.read()
  
