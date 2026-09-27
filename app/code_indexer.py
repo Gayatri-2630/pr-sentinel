@@ -14,6 +14,8 @@ from git import Repo
 from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
+import torch
+torch.set_num_threads(1)  # Reduces memory used by torch's internal thread pools -- meaningful on memory-constrained hosts like Render's free tier.
  
 # Where we'll keep local clones. Each repo gets its own subfolder, named
 # after its full_name with the slash replaced (GitHub repo names can't
