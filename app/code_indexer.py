@@ -14,6 +14,21 @@ from git import Repo
 from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
+ 
+# Where we'll keep local clones. Each repo gets its own subfolder, named
+# after its full_name with the slash replaced (GitHub repo names can't
+# contain colons or other path-unsafe characters, so this is safe).
+CLONE_BASE_DIR = "./repo_clones"
+INDEX_BASE_DIR = "./vector_indexes"
+ 
+# Set up the tree-sitter parser once, at import time -- this is lightweight,
+# unlike the embedding model below, so eager loading here is fine.
+PY_LANGUAGE = Language(tspython.language())
+_parser = Parser(PY_LANGUAGE)
+ 
+# The kinds of tree-sitter nodes we consider "a chunk worth indexing."
+CHUNKABLE_NODE_TYPES = {"function_definition", "class_definition"}
+ 
 # Files matching these patterns are NEVER indexed, embedded, or sent to
 # any LLM -- even if they somehow end up in a repo. This protects against
 # accidentally leaking real secrets to a third-party API.
@@ -30,32 +45,29 @@ SENSITIVE_FILE_PATTERNS = [
     ".npmrc",
     ".pypirc",
 ]
-
-
+ 
+ 
 def is_sensitive_file(file_path: str) -> bool:
     """Check if a file path matches any known sensitive-file pattern."""
     file_path_lower = file_path.lower()
     return any(pattern in file_path_lower for pattern in SENSITIVE_FILE_PATTERNS)
  
-# Where we'll keep local clones. Each repo gets its own subfolder, named
-# after its full_name with the slash replaced (GitHub repo names can't
-# contain colons or other path-unsafe characters, so this is safe).
-CLONE_BASE_DIR = "./repo_clones"
-INDEX_BASE_DIR = "./vector_indexes"
  
-# Set up the tree-sitter parser once, at import time, so we don't rebuild
-# it on every single file we parse.
-PY_LANGUAGE = Language(tspython.language())
-_parser = Parser(PY_LANGUAGE)
+# The embedding model is NOT loaded here at import time. On memory-
+# constrained hosts (like Render's free tier, 512MB RAM), loading this
+# eagerly can exceed the memory limit before the app even opens its port
+# to serve requests -- Render will kill the container as "out of memory"
+# before it ever gets a chance to respond to anything. Instead, we load
+# it lazily, the first time it's actually needed.
+_embedding_model = None
  
-# The kinds of tree-sitter nodes we consider "a chunk worth indexing."
-# Functions and classes are the meaningful units of code most reviewers
-# actually reason about -- not arbitrary line counts.
-CHUNKABLE_NODE_TYPES = {"function_definition", "class_definition"}
  
-# A small, fast, free, locally-run embedding model -- no API key or cost.
-# 384-dimensional vectors, good enough for code similarity at this scale.
-_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+def _get_embedding_model():
+    """Load the embedding model on first use only, then reuse it after that."""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedding_model
  
  
 def _local_path_for_repo(repo_full_name: str) -> str:
@@ -123,10 +135,6 @@ def chunk_python_file(file_path: str) -> list[dict]:
     Parse a single Python file and break it into a list of chunks, one per
     top-level function or class, instead of treating the whole file as one
     blob of text.
- 
-    Returns a list of dicts like:
-        {"name": "calculate_total", "type": "function_definition",
-         "start_line": 12, "end_line": 25, "code": "def calculate_total(...): ..."}
     """
     with open(file_path, "rb") as f:
         source_bytes = f.read()
@@ -141,13 +149,10 @@ def chunk_python_file(file_path: str) -> list[dict]:
             chunks.append({
                 "name": _extract_name(node, source_bytes),
                 "type": node.type,
-                "start_line": node.start_point[0] + 1,  # tree-sitter is 0-indexed, humans expect 1-indexed
+                "start_line": node.start_point[0] + 1,
                 "end_line": node.end_point[0] + 1,
                 "code": source_bytes[node.start_byte:node.end_byte].decode("utf-8"),
             })
-            # Deliberately not recursing into a function/class's children --
-            # we don't want to also chunk a method inside a class separately
-            # from the class itself, at least for this first version.
             return
         for child in node.children:
             walk(child)
@@ -171,15 +176,12 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
     the chunks together as one searchable FAISS index for this repo.
     Returns the total number of chunks indexed.
     """
-    # Folders we never want to walk into -- virtual envs, git internals,
-    # and dependency folders would otherwise flood the index with noise
-    # that has nothing to do with the actual project code.
     SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
  
     all_chunks = []
  
     for root, dirs, files in os.walk(local_repo_path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]  # prune in place, skip descending into them
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
  
         for filename in files:
             if not filename.endswith(".py"):
@@ -187,21 +189,19 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
  
             full_path = os.path.join(root, filename)
             relative_path = os.path.relpath(full_path, local_repo_path)
+ 
             if is_sensitive_file(relative_path):
                 print(f"Skipping sensitive file, not indexing: {relative_path}")
-
                 continue
  
             try:
                 chunks = chunk_python_file(full_path)
             except Exception as e:
-                # A single unparseable file (e.g. Python 2 syntax, or a
-                # weird encoding) shouldn't crash the whole indexing run.
                 print(f"Skipping {relative_path}, failed to parse: {e}")
                 continue
  
             for chunk in chunks:
-                chunk["file_path"] = relative_path  # so we know WHERE this chunk lives
+                chunk["file_path"] = relative_path
             all_chunks.extend(chunks)
  
     embed_and_store_chunks(repo_full_name, all_chunks)
@@ -218,7 +218,7 @@ def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
         return
  
     code_texts = [chunk["code"] for chunk in all_chunks]
-    embeddings = _embedding_model.encode(code_texts, show_progress_bar=False)
+    embeddings = _get_embedding_model().encode(code_texts, show_progress_bar=False)
     embeddings = np.array(embeddings, dtype="float32")
  
     dimension = embeddings.shape[1]  # 384 for this model
@@ -228,6 +228,10 @@ def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
     index_path, metadata_path = _index_paths_for_repo(repo_full_name)
     faiss.write_index(index, index_path)
  
+    # Bandit flags pickle as unsafe for untrusted data (B301) -- this is
+    # safe here because this file is generated entirely by our own
+    # embed_and_store_chunks() function, never from user-uploaded or
+    # externally-sourced data.
     with open(metadata_path, "wb") as f:
         pickle.dump(all_chunks, f)
  
@@ -247,7 +251,7 @@ def search_similar_chunks(repo_full_name: str, query_code: str, top_k: int = 5) 
     with open(metadata_path, "rb") as f:
         all_chunks = pickle.load(f)
  
-    query_embedding = _embedding_model.encode([query_code], show_progress_bar=False)
+    query_embedding = _get_embedding_model().encode([query_code], show_progress_bar=False)
     query_embedding = np.array(query_embedding, dtype="float32")
  
     distances, indices = index.search(query_embedding, min(top_k, len(all_chunks)))
@@ -255,7 +259,7 @@ def search_similar_chunks(repo_full_name: str, query_code: str, top_k: int = 5) 
     results = []
     for idx, distance in zip(indices[0], distances[0]):
         chunk = all_chunks[idx].copy()
-        chunk["similarity_distance"] = float(distance)  # lower = more similar
+        chunk["similarity_distance"] = float(distance)
         results.append(chunk)
  
     return results
