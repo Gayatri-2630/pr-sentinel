@@ -11,29 +11,19 @@ import stat
 import faiss
 import numpy as np
 from git import Repo
-from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
-import torch
-torch.set_num_threads(1)  # Reduces memory used by torch's internal thread pools -- meaningful on memory-constrained hosts like Render's free tier.
  
-# Where we'll keep local clones. Each repo gets its own subfolder, named
-# after its full_name with the slash replaced (GitHub repo names can't
-# contain colons or other path-unsafe characters, so this is safe).
+from app.llm_client import embed_texts
+ 
 CLONE_BASE_DIR = "./repo_clones"
 INDEX_BASE_DIR = "./vector_indexes"
  
-# Set up the tree-sitter parser once, at import time -- this is lightweight,
-# unlike the embedding model below, so eager loading here is fine.
 PY_LANGUAGE = Language(tspython.language())
 _parser = Parser(PY_LANGUAGE)
  
-# The kinds of tree-sitter nodes we consider "a chunk worth indexing."
 CHUNKABLE_NODE_TYPES = {"function_definition", "class_definition"}
  
-# Files matching these patterns are NEVER indexed, embedded, or sent to
-# any LLM -- even if they somehow end up in a repo. This protects against
-# accidentally leaking real secrets to a third-party API.
 SENSITIVE_FILE_PATTERNS = [
     ".env",
     ".pem",
@@ -55,23 +45,6 @@ def is_sensitive_file(file_path: str) -> bool:
     return any(pattern in file_path_lower for pattern in SENSITIVE_FILE_PATTERNS)
  
  
-# The embedding model is NOT loaded here at import time. On memory-
-# constrained hosts (like Render's free tier, 512MB RAM), loading this
-# eagerly can exceed the memory limit before the app even opens its port
-# to serve requests -- Render will kill the container as "out of memory"
-# before it ever gets a chance to respond to anything. Instead, we load
-# it lazily, the first time it's actually needed.
-_embedding_model = None
- 
- 
-def _get_embedding_model():
-    """Load the embedding model on first use only, then reuse it after that."""
-    global _embedding_model
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedding_model
- 
- 
 def _local_path_for_repo(repo_full_name: str) -> str:
     safe_name = repo_full_name.replace("/", "__")
     return os.path.join(CLONE_BASE_DIR, safe_name)
@@ -91,18 +64,9 @@ def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: 
     """
     Make sure we have a local, up-to-date clone of this repo.
     Returns the local path where the repo now lives.
- 
-    If we've never cloned it: clone fresh.
-    If we already have it: pull the latest changes instead of re-cloning
-    everything from scratch (this is the "incremental" part -- much faster
-    on repeat runs).
     """
     local_path = _local_path_for_repo(repo_full_name)
  
-    # Inject the installation token into the clone URL so git can
-    # authenticate -- GitHub accepts this "x-access-token" format.
-    # Installation tokens expire after about an hour, so we must refresh
-    # this on EVERY call, even for repos we've already cloned before.
     authenticated_url = clone_url.replace(
         "https://", f"https://x-access-token:{installation_token}@"
     )
@@ -110,8 +74,6 @@ def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: 
     if os.path.exists(local_path):
         try:
             repo = Repo(local_path)
-            # Refresh the remote URL with today's token before pulling --
-            # the token saved from the original clone may have expired.
             repo.remotes.origin.set_url(authenticated_url)
             repo.remotes.origin.pull()
             return local_path
@@ -135,8 +97,7 @@ def _extract_name(node, source_bytes: bytes) -> str:
 def chunk_python_file(file_path: str) -> list[dict]:
     """
     Parse a single Python file and break it into a list of chunks, one per
-    top-level function or class, instead of treating the whole file as one
-    blob of text.
+    top-level function or class.
     """
     with open(file_path, "rb") as f:
         source_bytes = f.read()
@@ -176,7 +137,6 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
     """
     Walk every Python file in a cloned repo, chunk each one, and store all
     the chunks together as one searchable FAISS index for this repo.
-    Returns the total number of chunks indexed.
     """
     SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
  
@@ -212,19 +172,19 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
  
 def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
     """
-    Turn a list of code chunks into embeddings and save them in a FAISS
-    index on disk, along with their metadata (name, file, line range) so
-    we can map a search result back to actual readable information.
+    Turn a list of code chunks into embeddings (via Gemini's remote
+    embedding API -- no local model loaded) and save them in a FAISS
+    index on disk, along with their metadata.
     """
     if not all_chunks:
         return
  
     code_texts = [chunk["code"] for chunk in all_chunks]
-    embeddings = _get_embedding_model().encode(code_texts, show_progress_bar=False)
+    embeddings = embed_texts(code_texts)
     embeddings = np.array(embeddings, dtype="float32")
  
-    dimension = embeddings.shape[1]  # 384 for this model
-    index = faiss.IndexFlatL2(dimension)  # simple, exact nearest-neighbor search
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
  
     index_path, metadata_path = _index_paths_for_repo(repo_full_name)
@@ -240,20 +200,19 @@ def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
  
 def search_similar_chunks(repo_full_name: str, query_code: str, top_k: int = 5) -> list[dict]:
     """
-    Given a piece of code (e.g. from a PR diff), find the most semantically
-    similar chunks already indexed for this repo -- this is the actual
-    'retrieval' in Retrieval-Augmented Generation.
+    Given a piece of code, find the most semantically similar chunks
+    already indexed for this repo.
     """
     index_path, metadata_path = _index_paths_for_repo(repo_full_name)
  
     if not os.path.exists(index_path):
-        return []  # repo hasn't been indexed yet
+        return []
  
     index = faiss.read_index(index_path)
     with open(metadata_path, "rb") as f:
         all_chunks = pickle.load(f)
  
-    query_embedding = _get_embedding_model().encode([query_code], show_progress_bar=False)
+    query_embedding = embed_texts([query_code])
     query_embedding = np.array(query_embedding, dtype="float32")
  
     distances, indices = index.search(query_embedding, min(top_k, len(all_chunks)))

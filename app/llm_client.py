@@ -17,19 +17,18 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-3.6-flash"
  
+# Embedding model name -- this may need adjusting once we see the real
+# error/response, same as MODEL_NAME above did earlier in this project.
+EMBEDDING_MODEL_NAME = "gemini-embedding-001"
+ 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
  
 _client = genai.Client(api_key=GEMINI_API_KEY)
  
 MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 5  # simple fixed backoff -- fine at our current call volume
+RETRY_DELAY_SECONDS = 5
  
-# A simple in-memory log of every LLM call made during the current request.
-# main.py reads and clears this after each webhook run, then saves it to
-# Postgres. Good enough for our single-request-at-a-time scale; a busier
-# production system would use a request-scoped context instead of a
-# module-level list.
 _usage_log = []
  
  
@@ -52,12 +51,6 @@ def get_and_clear_usage_log() -> list[dict]:
  
  
 def _is_daily_quota_error(error_message: str) -> bool:
-    """
-    429 errors can mean either 'daily quota exhausted' (retrying is
-    pointless for hours) or 'per-minute rate limit hit' (a short wait
-    genuinely helps). Gemini's error message includes the quotaId, which
-    tells us which one this is.
-    """
     return "PerDay" in error_message
  
  
@@ -65,12 +58,9 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
     """
     Send a prompt to Gemini and return its text response.
  
-    Retries on transient server-side errors (like 503 "high demand"),
-    since these usually resolve within a few seconds. Does NOT retry on
-    429 daily-quota-exhausted errors -- retrying there just wastes time
-    waiting for a quota that won't come back for hours. Raises
-    LLMQuotaExhaustedError immediately in that case so callers can fail
-    fast and clearly, instead of silently hanging or repeating failures.
+    Retries on transient server-side errors (like 503 "high demand").
+    Does NOT retry on 429 daily-quota-exhausted errors -- raises
+    LLMQuotaExhaustedError immediately instead, so callers can fail fast.
  
     Every successful call gets recorded in _usage_log, tagged with which
     agent made it -- this is what feeds the llm_usage table.
@@ -99,7 +89,7 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "latency_ms": latency_ms,
-                "cost_estimate": 0.0,  # Gemini free tier -- no real cost to track yet
+                "cost_estimate": 0.0,
             })
  
             return response.text
@@ -113,13 +103,9 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
  
             if is_quota_429:
                 if _is_daily_quota_error(error_message):
-                    # Daily quota gone -- fail immediately, no point retrying.
                     raise LLMQuotaExhaustedError(
                         f"Gemini daily quota exhausted for {agent_type} agent."
                     ) from e
-                # Per-minute limit -- a short wait can genuinely help, but
-                # don't burn all our retries on it since it can also mean
-                # the daily quota is close to gone.
                 if attempt < MAX_RETRIES:
                     print(f"Per-minute rate limit hit (attempt {attempt}/{MAX_RETRIES}), retrying in {RETRY_DELAY_SECONDS}s...")
                     time.sleep(RETRY_DELAY_SECONDS)
@@ -134,3 +120,22 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
                 continue
  
             raise last_error from e
+ 
+ 
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Get embeddings for a list of texts using Gemini's remote embedding API
+    -- NOT a local model. This is deliberately a remote API call, not a
+    locally-loaded sentence-transformers model, because loading torch +
+    a local model exceeded memory limits on constrained hosting (Render's
+    free tier, 512MB RAM). A remote call trades a bit of latency for a
+    much smaller, more deployable application.
+    """
+    embeddings = []
+    for text in texts:
+        result = _client.models.embed_content(
+            model=EMBEDDING_MODEL_NAME,
+            contents=text,
+        )
+        embeddings.append(result.embeddings[0].values)
+    return embeddings
