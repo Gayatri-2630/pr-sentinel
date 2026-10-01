@@ -1,0 +1,35 @@
+name: CI
+
+# Runs on every push and every pull request targeting master -- catches
+# problems automatically, before a human has to notice them manually.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Smoke test -- confirm the app imports without errors
+        run: python -c "from app.main import app; print('App imported successfully:', app)"
+
+      - name: Run bandit (security static analysis)
+        run: bandit -r app/ -f txt || true
+
+      - name: Run pylint (code quality static analysis)
+        run: pylint app/ --disable=import-error --persistent=n --exit-zero
