@@ -5,6 +5,7 @@ the webhook/pipeline code and the raw SQLAlchemy models.
  
 from datetime import datetime, timezone
  
+from sqlalchemy import Integer, func
 from sqlalchemy.orm import Session
  
 from app import models
@@ -139,6 +140,87 @@ def save_finding(db: Session, review_id: int, finding: dict) -> models.Finding:
     db.commit()
     db.refresh(finding_row)
     return finding_row
+ 
+ 
+def get_dashboard_stats(db: Session) -> dict:
+    """
+    Pull together the real numbers that have been quietly accumulating
+    in the database this whole project -- per-agent latency, token/cost
+    usage, and finding counts by severity and verification status. This
+    is what the observability dashboard displays.
+    """
+    total_reviews = db.query(func.count(models.Review.id)).scalar() or 0
+ 
+    completed_reviews = (
+        db.query(func.avg(models.Review.total_latency_ms))
+        .filter(models.Review.status == "completed")
+        .scalar()
+    )
+    avg_review_latency_ms = round(completed_reviews) if completed_reviews else 0
+ 
+    # Average latency and total tokens, grouped by agent -- this is
+    # exactly the "which agent is slowest/most expensive?" question
+    # we set out to answer back when we built LLM usage tracking.
+    usage_by_agent = (
+        db.query(
+            models.LLMUsage.agent_type,
+            func.avg(models.LLMUsage.latency_ms).label("avg_latency_ms"),
+            func.sum(models.LLMUsage.input_tokens + models.LLMUsage.output_tokens).label("total_tokens"),
+            func.count(models.LLMUsage.id).label("call_count"),
+        )
+        .group_by(models.LLMUsage.agent_type)
+        .all()
+    )
+ 
+    # Findings grouped by agent and verification status -- this answers
+    # "which agent produces the most false positives?"
+    findings_by_agent = (
+        db.query(
+            models.Finding.agent_type,
+            func.count(models.Finding.id).label("total_findings"),
+            func.sum(func.cast(models.Finding.verified, Integer)).label("verified_count"),
+        )
+        .group_by(models.Finding.agent_type)
+        .all()
+    )
+ 
+    findings_by_severity = (
+        db.query(
+            models.Finding.severity,
+            func.count(models.Finding.id).label("count"),
+        )
+        .group_by(models.Finding.severity)
+        .all()
+    )
+ 
+    return {
+        "total_reviews": total_reviews,
+        "avg_review_latency_ms": avg_review_latency_ms,
+        "usage_by_agent": [
+            {
+                "agent_type": row.agent_type,
+                "avg_latency_ms": round(row.avg_latency_ms) if row.avg_latency_ms else 0,
+                "total_tokens": row.total_tokens or 0,
+                "call_count": row.call_count,
+            }
+            for row in usage_by_agent
+        ],
+        "findings_by_agent": [
+            {
+                "agent_type": row.agent_type,
+                "total_findings": row.total_findings,
+                "verified_count": row.verified_count or 0,
+                "false_positive_rate": round(
+                    (1 - (row.verified_count or 0) / row.total_findings) * 100, 1
+                ) if row.total_findings else 0,
+            }
+            for row in findings_by_agent
+        ],
+        "findings_by_severity": [
+            {"severity": row.severity, "count": row.count}
+            for row in findings_by_severity
+        ],
+    }
  
  
 def save_llm_usage(db: Session, review_id: int, usage: dict) -> models.LLMUsage:
