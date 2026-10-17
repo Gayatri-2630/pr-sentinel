@@ -1,10 +1,11 @@
 """
-Handles getting a local, up-to-date copy of a repo's code so we can read
-more than just the diff -- this is the foundation for our RAG pipeline.
+Handles getting a local copy of a repo checked out at the PULL REQUEST's
+head commit, then chunking and indexing it for retrieval (RAG).
 """
  
 import os
 import pickle
+import re
 import shutil
 import stat
  
@@ -38,6 +39,8 @@ SENSITIVE_FILE_PATTERNS = [
     ".pypirc",
 ]
  
+_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+ 
  
 def is_sensitive_file(file_path: str) -> bool:
     """Check if a file path matches any known sensitive-file pattern."""
@@ -53,41 +56,63 @@ def _local_path_for_repo(repo_full_name: str) -> str:
 def _remove_readonly(func, path, _exc_info):
     """
     Windows marks git's internal pack files as read-only, which blocks normal
-    deletion. This clears that flag and retries -- a well-known workaround
-    for GitPython + shutil.rmtree on Windows specifically.
+    deletion. This clears that flag and retries.
     """
     os.chmod(path, stat.S_IWRITE)
     func(path)
  
  
-def ensure_repo_cloned(repo_full_name: str, clone_url: str, installation_token: str) -> str:
+def ensure_repo_cloned(
+    repo_full_name: str,
+    clone_url: str,
+    installation_token: str,
+    pr_number: int,
+    head_sha: str,
+) -> str:
     """
-    Make sure we have a local, up-to-date clone of this repo.
-    Returns the local path where the repo now lives.
+    Make sure we have a local clone checked out at the PR's head commit,
+    and return its path.
+ 
+    Previously this only cloned/pulled the repo's DEFAULT branch, so static
+    analysis and indexing ran on the base branch instead of the code under
+    review. Now we fetch the PR's own ref and check out its exact commit.
     """
+    # Both values come from GitHub's signed webhook, but they are passed to
+    # git as arguments, so validate their shape anyway.
+    if not _SHA_PATTERN.match(head_sha):
+        raise ValueError(f"Refusing to check out unexpected commit id: {head_sha!r}")
+    pr_number = int(pr_number)
+ 
     local_path = _local_path_for_repo(repo_full_name)
  
+    # Installation tokens expire after about an hour, so the remote URL is
+    # refreshed with a new token on every call.
     authenticated_url = clone_url.replace(
         "https://", f"https://x-access-token:{installation_token}@"
     )
  
+    repo = None
     if os.path.exists(local_path):
         try:
             repo = Repo(local_path)
             repo.remotes.origin.set_url(authenticated_url)
-            repo.remotes.origin.pull()
-            return local_path
-        except Exception as e:
-            print(f"Existing clone failed to update ({e}), re-cloning from scratch.")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"Existing clone is unusable ({e}), re-cloning from scratch.")
             shutil.rmtree(local_path, onerror=_remove_readonly)
+            repo = None
  
-    os.makedirs(CLONE_BASE_DIR, exist_ok=True)
-    Repo.clone_from(authenticated_url, local_path)
+    if repo is None:
+        os.makedirs(CLONE_BASE_DIR, exist_ok=True)
+        repo = Repo.clone_from(authenticated_url, local_path)
+ 
+    # GitHub exposes every pull request's head commit as pull/<number>/head.
+    repo.git.fetch("origin", f"pull/{pr_number}/head")
+    repo.git.checkout("--force", "--detach", head_sha)
     return local_path
  
  
 def _extract_name(node, source_bytes: bytes) -> str:
-    """Pull the function/class name out of a tree-sitter node, e.g. 'calculate_total'."""
+    """Pull the function/class name out of a tree-sitter node."""
     for child in node.children:
         if child.type == "identifier":
             return source_bytes[child.start_byte:child.end_byte].decode("utf-8")
@@ -96,8 +121,8 @@ def _extract_name(node, source_bytes: bytes) -> str:
  
 def chunk_python_file(file_path: str) -> list[dict]:
     """
-    Parse a single Python file and break it into a list of chunks, one per
-    top-level function or class.
+    Parse a single Python file and break it into one chunk per top-level
+    function or class.
     """
     with open(file_path, "rb") as f:
         source_bytes = f.read()
@@ -135,15 +160,15 @@ def _index_paths_for_repo(repo_full_name: str) -> tuple[str, str]:
  
 def index_repository(repo_full_name: str, local_repo_path: str) -> int:
     """
-    Walk every Python file in a cloned repo, chunk each one, and store all
-    the chunks together as one searchable FAISS index for this repo.
+    Walk every Python file in the checked-out repo, chunk each one, and
+    store all the chunks together as one searchable FAISS index.
     """
-    SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
+    skip_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
  
     all_chunks = []
  
     for root, dirs, files in os.walk(local_repo_path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
  
         for filename in files:
             if not filename.endswith(".py"):
@@ -158,7 +183,7 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
  
             try:
                 chunks = chunk_python_file(full_path)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 print(f"Skipping {relative_path}, failed to parse: {e}")
                 continue
  
@@ -172,9 +197,8 @@ def index_repository(repo_full_name: str, local_repo_path: str) -> int:
  
 def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
     """
-    Turn a list of code chunks into embeddings (via Gemini's remote
-    embedding API -- no local model loaded) and save them in a FAISS
-    index on disk, along with their metadata.
+    Embed code chunks via Gemini's remote embedding API (no local model) and
+    save them in a FAISS index on disk, along with their metadata.
     """
     if not all_chunks:
         return
@@ -190,19 +214,14 @@ def embed_and_store_chunks(repo_full_name: str, all_chunks: list[dict]) -> None:
     index_path, metadata_path = _index_paths_for_repo(repo_full_name)
     faiss.write_index(index, index_path)
  
-    # Bandit flags pickle as unsafe for untrusted data (B301) -- this is
-    # safe here because this file is generated entirely by our own
-    # embed_and_store_chunks() function, never from user-uploaded or
-    # externally-sourced data.
+    # Bandit flags pickle as unsafe for untrusted data (B301). This file is
+    # generated entirely by our own code above, never from external input.
     with open(metadata_path, "wb") as f:
         pickle.dump(all_chunks, f)
  
  
 def search_similar_chunks(repo_full_name: str, query_code: str, top_k: int = 5) -> list[dict]:
-    """
-    Given a piece of code, find the most semantically similar chunks
-    already indexed for this repo.
-    """
+    """Find the indexed chunks most semantically similar to the given code."""
     index_path, metadata_path = _index_paths_for_repo(repo_full_name)
  
     if not os.path.exists(index_path):
