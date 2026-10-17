@@ -261,3 +261,5 @@ async def github_webhook(
     # trigger scoped static analysis test
    import os
    password = "admin123"
+   import pickle
+   password = "hunter2"
