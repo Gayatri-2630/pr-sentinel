@@ -19,7 +19,7 @@ MODEL_NAME = "gemini-3.6-flash"
  
 # Embedding model name -- this may need adjusting once we see the real
 # error/response, same as MODEL_NAME above did earlier in this project.
-EMBEDDING_MODEL_NAME = "gemini-embedding-001"
+EMBEDDING_MODEL_NAME = "text-embedding-004"
  
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
@@ -122,20 +122,33 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
             raise last_error from e
  
  
+EMBEDDING_BATCH_SIZE = 20
+ 
+ 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Get embeddings for a list of texts using Gemini's remote embedding API
-    -- NOT a local model. This is deliberately a remote API call, not a
-    locally-loaded sentence-transformers model, because loading torch +
-    a local model exceeded memory limits on constrained hosting (Render's
-    free tier, 512MB RAM). A remote call trades a bit of latency for a
-    much smaller, more deployable application.
+    Get embeddings from Gemini's remote embedding API (NOT a local model:
+    loading torch + a local model exceeded the 512MB limit on Render's free
+    tier). Texts are sent in batches instead of one request per text.
+    If a batched request fails or returns the wrong number of vectors, we
+    fall back to one request per text, so the result is always correct.
     """
     embeddings = []
-    for text in texts:
-        result = _client.models.embed_content(
-            model=EMBEDDING_MODEL_NAME,
-            contents=text,
-        )
-        embeddings.append(result.embeddings[0].values)
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+        try:
+            result = _client.models.embed_content(
+                model=EMBEDDING_MODEL_NAME,
+                contents=batch,
+            )
+            vectors = [item.values for item in result.embeddings]
+            if len(vectors) != len(batch):
+                raise ValueError(f"expected {len(batch)} embeddings, got {len(vectors)}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"Batched embedding failed ({e}); falling back to one request per chunk.")
+            vectors = []
+            for text in batch:
+                single = _client.models.embed_content(model=EMBEDDING_MODEL_NAME, contents=text)
+                vectors.append(single.embeddings[0].values)
+        embeddings.extend(vectors)
     return embeddings
