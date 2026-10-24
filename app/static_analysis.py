@@ -114,6 +114,18 @@ def run_bandit(repo_path: str, files: list[str] | None = None) -> list[dict]:
             "message": f"[{issue.get('test_id')}] {issue.get('issue_text', '')}",
         })
  
+    # Bandit reports files it could not parse (for example a syntax error)
+    # in a separate "errors" list and silently skips them. Surface those as
+    # findings, so an unscanned file never looks the same as a clean one.
+    for error in data.get("errors", []):
+        findings.append({
+            "agent_type": "static_analysis_bandit",
+            "file_path": _repo_relative(error.get("filename", "unknown"), repo_path),
+            "line_number": None,
+            "severity": "medium",
+            "message": f"Bandit could not analyze this file: {error.get('reason', 'unknown reason')}",
+        })
+ 
     return findings
  
  
