@@ -17,9 +17,7 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-3.6-flash"
  
-# Embedding model name -- this may need adjusting once we see the real
-# error/response, same as MODEL_NAME above did earlier in this project.
-EMBEDDING_MODEL_NAME = "text-embedding-004"
+EMBEDDING_MODEL_NAME = "gemini-embedding-001"
  
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
