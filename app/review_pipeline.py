@@ -13,6 +13,7 @@ from app.database import SessionLocal
 from app.github_api import get_pr_diff
 from app.github_auth import get_installation_token
 from app.llm_client import get_and_clear_usage_log
+from app.pr_comment import post_review_comment
 from app.security_filters import redact_secrets
  
 logger = logging.getLogger("pr-sentinel")
@@ -96,6 +97,21 @@ def process_pr_event(
             crud.save_llm_usage(db, review_id=review_id, usage=usage)
         total_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usage_records)
         logger.info("[review %s] Logged %s LLM calls, %s total tokens.", review_id, len(usage_records), total_tokens)
+ 
+        # Show the results to the people using the PR. A failure here (for
+        # example a missing permission) must never fail the review itself.
+        try:
+            post_review_comment(
+                installation_id=installation_id,
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+                review_id=review_id,
+                findings=findings,
+                ai_status=ai_status,
+            )
+            logger.info("[review %s] Posted summary comment on PR #%s.", review_id, pr_number)
+        except Exception as comment_error:  # pylint: disable=broad-exception-caught
+            logger.error("[review %s] Could not post PR comment: %s", review_id, comment_error)
  
         crud.mark_review_completed(db, review_row)
         logger.info("[review %s] Pipeline completed successfully.", review_id)
