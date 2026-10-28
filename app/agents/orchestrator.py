@@ -77,9 +77,22 @@ def run_all_agents(diff_text: str, repo_path: str = None) -> tuple[list[dict], d
                 ai_status[agent_type] = "error"
                 findings = []
 
+            valid_findings = []
             for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                if not {"file_path", "line_number", "severity", "message"} <= finding.keys():
+                    continue
+                try:
+                    finding["line_number"] = int(finding["line_number"])
+                except (TypeError, ValueError):
+                    continue
                 finding["agent_type"] = agent_type
-            ai_findings.extend(findings)
+                valid_findings.append(finding)
+            dropped = len(findings) - len(valid_findings)
+            if dropped:
+                print(f"{agent_type} agent: dropped {dropped} malformed finding(s).")
+            ai_findings.extend(valid_findings)
 
         # No point calling the verifier if no AI agent produced anything.
         if ai_findings:

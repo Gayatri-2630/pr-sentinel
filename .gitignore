@@ -8,3 +8,4 @@ venv/
 *.db
 repo_clones/
 vector_indexes/
+eval/results/
