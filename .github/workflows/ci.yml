@@ -1,54 +1,22 @@
 name: CI
- 
+
 on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
- 
+
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
- 
-    # A real, temporary Postgres database that exists only for this CI
-    # run -- GitHub spins it up before the steps below start, and tears
-    # it down automatically when the job finishes.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: pr_sentinel
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
- 
     steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
- 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
- 
+          cache: pip
       - name: Install dependencies
-        run: pip install -r requirements.txt
- 
-      - name: Smoke test -- confirm the app imports and connects to the DB
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pr_sentinel
-        run: python -c "from app.main import app; print('App imported successfully:', app)"
- 
-      - name: Run bandit (security static analysis)
-        run: bandit -r app/ -f txt || true
- 
-      - name: Run pylint (code quality static analysis)
-        run: pylint app/ --disable=import-error --persistent=n --exit-zero
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
