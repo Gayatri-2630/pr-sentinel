@@ -7,10 +7,15 @@ Finding text comes from LLM output and from the code under review, so it is
 untrusted. Before it goes into GitHub markdown it is sanitized: @mentions
 are defused (no pinging strangers), HTML is escaped, and table-breaking
 characters are neutralized.
+
+Findings that several tools report for the same problem are merged for
+display only. The database keeps every raw finding, so per-agent statistics
+on the dashboard stay accurate.
 """
 
 import requests
 
+from app.findings_merge import merge_duplicate_findings
 from app.github_auth import get_installation_token
 
 COMMENT_MARKER = "<!-- pr-sentinel-review -->"
@@ -32,7 +37,7 @@ SOURCE_LABELS = {
 def _sanitize(text, limit=MAX_MESSAGE_CHARS) -> str:
     text = str(text).replace("\r", " ").replace("\n", " ")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = text.replace("@", "@\u200b")  # defuse @mentions
+    text = text.replace("@", "@​")  # defuse @mentions
     text = text.replace("|", "\\|")      # keep table cells intact
     if len(text) > limit:
         text = text[: limit - 3] + "..."
@@ -41,10 +46,13 @@ def _sanitize(text, limit=MAX_MESSAGE_CHARS) -> str:
 
 def _row(finding: dict) -> str:
     source = SOURCE_LABELS.get(finding.get("agent_type"), finding.get("agent_type", "unknown"))
+    extra = [SOURCE_LABELS.get(name, name) for name in finding.get("also_reported_by", [])]
+    if extra:
+        source = f"{source} + {', '.join(extra)}"
     line = finding.get("line_number")
     location = f"{_sanitize(finding.get('file_path', 'unknown'), 120)}" + (f":{line}" if line else "")
     return (
-        f"| {_sanitize(finding.get('severity', 'low'), 12)} | {_sanitize(source, 30)} "
+        f"| {_sanitize(finding.get('severity', 'low'), 12)} | {_sanitize(source, 60)} "
         f"| `{location.replace('`', '')}` | {_sanitize(finding.get('message', ''))} |"
     )
 
@@ -64,6 +72,7 @@ def _table(findings: list[dict]) -> str:
 def build_comment_body(review_id: int, findings: list[dict], ai_status: dict) -> str:
     """Verified AI findings and all static findings are shown up front.
     AI findings the verifier could not confirm are collapsed, not hidden."""
+    findings = merge_duplicate_findings(findings)
     trusted = [f for f in findings if f.get("verified")]
     unverified = [f for f in findings if not f.get("verified")]
 

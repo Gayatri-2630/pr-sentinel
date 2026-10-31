@@ -2,28 +2,29 @@ import hashlib
 import hmac
 import logging
 import os
- 
+
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
- 
+
 from app import crud, models  # pylint: disable=unused-import  # noqa: F401 -- models import registers tables on Base
 from app.database import Base, engine, get_db
 from app.review_pipeline import process_pr_event
- 
+
 load_dotenv()
- 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pr-sentinel")
- 
+
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
- 
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
+
 app = FastAPI(title="PR Sentinel", version="0.1.0")
- 
+
 Base.metadata.create_all(bind=engine)
- 
- 
+
+
 def verify_signature(payload_body: bytes, signature_header: str | None) -> bool:
     """
     Verify the webhook actually came from GitHub, not a spoofed request.
@@ -35,20 +36,36 @@ def verify_signature(payload_body: bytes, signature_header: str | None) -> bool:
     if not GITHUB_WEBHOOK_SECRET:
         logger.warning("GITHUB_WEBHOOK_SECRET is not set -- refusing all webhooks")
         return False
- 
+
     digest = hmac.new(
         GITHUB_WEBHOOK_SECRET.encode("utf-8"), msg=payload_body, digestmod=hashlib.sha256
     ).hexdigest()
     expected_signature = f"sha256={digest}"
     return hmac.compare_digest(expected_signature, signature_header)
- 
- 
+
+
+def require_token(authorization: str | None = Header(default=None)):
+    """
+    Protects the read endpoints. The caller must send
+    'Authorization: Bearer <token>'. The token is accepted from the header
+    only, never from the URL, because URLs end up in server logs.
+    If DASHBOARD_TOKEN is not configured, everything is denied.
+    """
+    if not DASHBOARD_TOKEN:
+        raise HTTPException(status_code=503, detail="Access token not configured")
+    supplied = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied.encode(), DASHBOARD_TOKEN.encode()):
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
- 
- 
-@app.get("/reviews/{review_id}")
+
+
+@app.get("/reviews/{review_id}", dependencies=[Depends(require_token)])
 def get_review_status(review_id: int, db: Session = Depends(get_db)):
     """
     Job-status endpoint: lets you check on a review's progress without
@@ -57,7 +74,7 @@ def get_review_status(review_id: int, db: Session = Depends(get_db)):
     review = crud.get_review_by_id(db, review_id)
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")
- 
+
     findings = [
         {
             "agent_type": f.agent_type,
@@ -69,7 +86,7 @@ def get_review_status(review_id: int, db: Session = Depends(get_db)):
         }
         for f in review.findings
     ]
- 
+
     return {
         "review_id": review.id,
         "pr_number": review.pr_number,
@@ -80,17 +97,17 @@ def get_review_status(review_id: int, db: Session = Depends(get_db)):
         "findings_count": len(findings),
         "findings": findings,
     }
- 
- 
-@app.get("/dashboard/data")
+
+
+@app.get("/dashboard/data", dependencies=[Depends(require_token)])
 def get_dashboard_data(db: Session = Depends(get_db)):
     """
     Returns aggregated stats (latency, token usage, false-positive rates)
     as JSON -- the data source for the observability dashboard page below.
     """
     return crud.get_dashboard_stats(db)
- 
- 
+
+
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -119,28 +136,38 @@ DASHBOARD_HTML = """
     runs -- see the project's debug log for details). Recent runs correctly show 0% false positives
     for bandit/pylint, since those are now trusted directly as deterministic tools.
   </div>
- 
+
   <div class="stats" id="summaryStats"></div>
- 
+
   <div class="charts">
     <div class="chart-box"><h3>Avg LLM Latency by Agent (ms)</h3><canvas id="latencyChart"></canvas></div>
     <div class="chart-box"><h3>Total Tokens Used by Agent</h3><canvas id="tokensChart"></canvas></div>
     <div class="chart-box"><h3>False Positive Rate by Agent (%)</h3><canvas id="fpChart"></canvas></div>
     <div class="chart-box"><h3>Findings by Severity</h3><canvas id="severityChart"></canvas></div>
   </div>
- 
+
   <script>
     async function loadDashboard() {
-      const res = await fetch('/dashboard/data');
+      let token = sessionStorage.getItem('dashToken');
+      if (!token) {
+        token = window.prompt('Enter access token');
+        if (token) sessionStorage.setItem('dashToken', token);
+      }
+      const res = await fetch('/dashboard/data', { headers: { Authorization: 'Bearer ' + token } });
+      if (res.status === 401 || res.status === 503) {
+        sessionStorage.removeItem('dashToken');
+        document.body.innerHTML = '<p style="padding:24px">Access denied. Reload and enter a valid token.</p>';
+        return;
+      }
       const data = await res.json();
- 
+
       document.getElementById('summaryStats').innerHTML = `
         <div class="stat-card"><div class="label">Total Reviews</div><div class="value">${data.total_reviews}</div></div>
         <div class="stat-card"><div class="label">Avg Review Latency</div><div class="value">${(data.avg_review_latency_ms / 1000).toFixed(1)}s</div></div>
       `;
- 
+
       const colors = ['#5b8def', '#e8a33d', '#4caf7d', '#d9546e', '#9b7ede'];
- 
+
       new Chart(document.getElementById('latencyChart'), {
         type: 'bar',
         data: {
@@ -149,7 +176,7 @@ DASHBOARD_HTML = """
         },
         options: { plugins: { legend: { display: false } } }
       });
- 
+
       new Chart(document.getElementById('tokensChart'), {
         type: 'bar',
         data: {
@@ -158,7 +185,7 @@ DASHBOARD_HTML = """
         },
         options: { plugins: { legend: { display: false } } }
       });
- 
+
       new Chart(document.getElementById('fpChart'), {
         type: 'bar',
         data: {
@@ -167,7 +194,7 @@ DASHBOARD_HTML = """
         },
         options: { plugins: { legend: { display: false } } }
       });
- 
+
       new Chart(document.getElementById('severityChart'), {
         type: 'doughnut',
         data: {
@@ -181,14 +208,15 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
- 
- 
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard_page():
-    """The actual visual observability dashboard -- charts built on top of /dashboard/data."""
+    """The visual observability dashboard shell. The page itself holds no data;
+    the numbers come from /dashboard/data, which requires the access token."""
     return DASHBOARD_HTML
- 
- 
+
+
 @app.post("/webhook")
 async def github_webhook(
     request: Request,
@@ -198,26 +226,26 @@ async def github_webhook(
     db: Session = Depends(get_db),
 ):
     raw_body = await request.body()
- 
+
     if not verify_signature(raw_body, x_hub_signature_256):
         logger.warning("Webhook signature verification FAILED -- rejecting request")
         raise HTTPException(status_code=401, detail="Invalid signature")
- 
+
     payload = await request.json()
     logger.info("Verified GitHub event received: %s", x_github_event)
- 
+
     if x_github_event == "pull_request":
         action = payload.get("action")
         if action in ("opened", "synchronize", "reopened"):
             pr = payload["pull_request"]
             repo = payload["repository"]
             installation_id = payload["installation"]["id"]
- 
+
             logger.info(
                 "PR #%s (%s) on %s -- head sha %s -- queuing for background processing",
                 pr["number"], action, repo["full_name"], pr["head"]["sha"][:8],
             )
- 
+
             installation_row = crud.get_or_create_installation(
                 db,
                 github_installation_id=installation_id,
@@ -236,7 +264,7 @@ async def github_webhook(
                 head_sha=pr["head"]["sha"],
             )
             logger.info("Created review id=%s with status 'pending' for PR #%s", review_row.id, pr["number"])
- 
+
             background_tasks.add_task(
                 process_pr_event,
                 review_id=review_row.id,
@@ -248,7 +276,7 @@ async def github_webhook(
                 pr_number=pr["number"],
                 head_sha=pr["head"]["sha"],
             )
- 
+
             return {
                 "status": "queued",
                 "pr_number": pr["number"],
@@ -256,5 +284,5 @@ async def github_webhook(
                 "review_id": review_row.id,
                 "check_status_at": f"/reviews/{review_row.id}",
             }
- 
+
     return {"status": "ignored", "event": x_github_event}
