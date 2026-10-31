@@ -16,6 +16,9 @@ BANDIT_SEVERITY_MAP = {
     "MEDIUM": "medium",
     "HIGH": "high",
 }
+# Informational Bandit notices that duplicate the real call-site finding
+# (e.g. "import pickle" duplicates pickle.loads) or flag every safe subprocess call.
+BANDIT_IGNORED_TESTS = {f"B{n}" for n in range(401, 416)} | {"B603", "B607"}
  
 PYLINT_SEVERITY_MAP = {
     "fatal": "critical",
@@ -81,7 +84,7 @@ def run_bandit(repo_path: str, files: list[str] | None = None) -> list[dict]:
     targets = _resolve_targets(repo_path, files)
     if not targets:
         return []
- 
+
     try:
         # check=False: bandit exits non-zero when it FINDS issues -- expected.
         # The command is a fixed list; target paths were validated above and
@@ -103,9 +106,11 @@ def run_bandit(repo_path: str, files: list[str] | None = None) -> list[dict]:
             "severity": "low",
             "message": f"Bandit could not complete: {e}",
         }]
- 
+
     findings = []
     for issue in data.get("results", []):
+        if issue.get("test_id") in BANDIT_IGNORED_TESTS:
+            continue
         findings.append({
             "agent_type": "static_analysis_bandit",
             "file_path": _repo_relative(issue.get("filename", "unknown"), repo_path),
@@ -113,7 +118,7 @@ def run_bandit(repo_path: str, files: list[str] | None = None) -> list[dict]:
             "severity": BANDIT_SEVERITY_MAP.get(issue.get("issue_severity", "LOW"), "low"),
             "message": f"[{issue.get('test_id')}] {issue.get('issue_text', '')}",
         })
- 
+
     # Bandit reports files it could not parse (for example a syntax error)
     # in a separate "errors" list and silently skips them. Surface those as
     # findings, so an unscanned file never looks the same as a clean one.
@@ -125,7 +130,7 @@ def run_bandit(repo_path: str, files: list[str] | None = None) -> list[dict]:
             "severity": "medium",
             "message": f"Bandit could not analyze this file: {error.get('reason', 'unknown reason')}",
         })
- 
+
     return findings
  
  

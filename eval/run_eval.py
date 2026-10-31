@@ -1,43 +1,46 @@
 """
-PR Sentinel evaluation harness.
+PR Sentinel evaluation harness (v2: multiple sets, repeated runs).
 
 Run from the project root (the folder that contains `app/` and `eval/`):
 
-    python -m eval.run_eval                # run all cases (resumes from cache)
-    python -m eval.run_eval --limit 3      # quick smoke test
-    python -m eval.run_eval --force        # ignore cached results
-    python -m eval.run_eval --report-only  # just rebuild the report
+    python -m eval.run_eval                      # v1 set, 1 run per case
+    python -m eval.run_eval --set v2 --repeats 3 # harder set, 3 runs per case
+    python -m eval.run_eval --set v2 --limit 2   # quick smoke test
+    python -m eval.run_eval --set v2 --report-only
+    python -m eval.run_eval --force              # ignore cached results
 
-Each case is run through the real pipeline once (`run_all_agents`). Every
-variant below is computed from that single run, so there are no extra LLM calls.
+Each case is run through the real pipeline (`run_all_agents`). All variants are
+computed from that one run per case, so there are no extra LLM calls.
 
-Scoring rules (kept simple on purpose):
+Scoring (kept simple on purpose):
 - Only security + logic AI findings and Bandit findings are scored. Style and
-  Pylint findings are subjective/noisy and are reported separately.
+  Pylint findings are subjective/noisy and are not scored.
 - A finding is a true positive if it is in the right file and within +/-3 lines
   of a labeled bug line. A bug counts as found if at least one finding matches.
 - Any scored finding that matches no bug is a false positive (this includes
-  every scored finding on clean cases).
+  every scored finding on clean files).
+- With --repeats N, every metric is computed per repeat, then reported as the
+  mean with the min-max range.
 """
 
 import argparse
+import importlib
 import json
 import tempfile
 import time
 from pathlib import Path
 
 from app.agents.orchestrator import run_all_agents
-from eval.cases import CASES
 
 try:
     from app.llm_client import get_and_clear_usage_log
 except Exception:  # pragma: no cover
     get_and_clear_usage_log = None
 
-RESULTS_DIR = Path(__file__).parent / "results"
-CACHE_DIR = RESULTS_DIR / "cases"
+BASE_DIR = Path(__file__).parent / "results"
 FILE_PATH = "app/sample.py"
 LINE_TOLERANCE = 3
+INR_PER_USD = 90  # rough conversion, only for cost printouts
 SCORED_AI = {"security", "logic"}
 BANDIT = "static_analysis_bandit"
 
@@ -63,9 +66,7 @@ def expected_lines(case) -> list[int]:
     for needle in case["expected"]:
         hits = [i + 1 for i, line in enumerate(lines) if needle in line]
         if len(hits) != 1:
-            raise ValueError(
-                f"{case['id']}: marker {needle!r} matched {len(hits)} lines"
-            )
+            raise ValueError(f"{case['id']}: marker {needle!r} matched {len(hits)} lines")
         result.append(hits[0])
     return result
 
@@ -85,14 +86,15 @@ def run_case(case) -> dict:
         findings, ai_status = run_all_agents(make_diff(case["code"]), repo)
         elapsed = time.time() - start
 
-        calls, tokens = 0, 0
+        calls, tokens, cost = 0, 0, 0.0
         if get_and_clear_usage_log:
             try:
                 log = get_and_clear_usage_log() or []
                 calls = len(log)
                 for entry in log:
                     if isinstance(entry, dict):
-                        tokens += int(entry.get("total_tokens", 0) or 0)
+                        tokens += int(entry.get("input_tokens", 0) or 0) + int(entry.get("output_tokens", 0) or 0)
+                        cost += float(entry.get("cost_estimate", 0) or 0)
             except Exception:
                 pass
 
@@ -103,6 +105,7 @@ def run_case(case) -> dict:
         "seconds": round(elapsed, 1),
         "llm_calls": calls,
         "tokens": tokens,
+        "cost_usd": round(cost, 6),
     }
 
 
@@ -128,19 +131,24 @@ VARIANTS = {
     "Full pipeline (no verifier)": lambda f: f["agent_type"] in SCORED_AI or f["agent_type"] == BANDIT,
     "Full pipeline (verified only)": lambda f: (f["agent_type"] in SCORED_AI and f.get("verified") is True) or f["agent_type"] == BANDIT,
 }
+MAIN_VARIANT = "Full pipeline (verified only)"
 
 
-def score(results: dict, selector, category=None):
-    tp = fp = bugs = found = 0
-    for case in CASES:
+def score_run(cases, run, selector, category=None):
+    """Score one repeat. `run` maps case id -> result."""
+    fp = bugs = found = 0
+    clean_total = clean_flagged = 0
+    found_ids = set()
+    for case in cases:
         if category and case["category"] != category:
             continue
-        res = results.get(case["id"])
+        res = run.get(case["id"])
         if res is None:
             continue
         exp = expected_lines(case)
         bugs += len(exp)
         hits = [False] * len(exp)
+        case_fp = 0
         for f in res["findings"]:
             if not selector(f):
                 continue
@@ -151,63 +159,104 @@ def score(results: dict, selector, category=None):
                     hits[i] = True
                     matched = True
             if not matched:
-                fp += 1
+                case_fp += 1
+        fp += case_fp
         found += sum(hits)
-        tp += sum(hits)
-    precision = tp / (tp + fp) if (tp + fp) else float("nan")
-    recall = found / bugs if bugs else float("nan")
-    return dict(bugs=bugs, found=found, fp=fp, precision=precision, recall=recall)
+        for i, h in enumerate(hits):
+            if h:
+                found_ids.add((case["id"], i))
+        if case["kind"] == "clean":
+            clean_total += 1
+            if any(selector(f) for f in res["findings"]):
+                clean_flagged += 1
+    precision = found / (found + fp) if (found + fp) else None
+    recall = found / bugs if bugs else None
+    return dict(bugs=bugs, found=found, fp=fp, precision=precision, recall=recall,
+                clean_total=clean_total, clean_flagged=clean_flagged, found_ids=found_ids)
 
 
-def clean_false_alarm_rate(results, selector):
-    clean = [c for c in CASES if c["kind"] == "clean" and c["id"] in results]
-    if not clean:
-        return float("nan"), 0
-    flagged = sum(
-        1 for c in clean
-        if any(selector(f) for f in results[c["id"]]["findings"])
-    )
-    return flagged / len(clean), len(clean)
+def fmt_range(values, as_pct=True):
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "n/a"
+    mean = sum(vals) / len(vals)
+    if as_pct:
+        text = f"{mean * 100:.0f}%"
+        if len(vals) > 1 and min(vals) != max(vals):
+            text += f" ({min(vals) * 100:.0f}-{max(vals) * 100:.0f}%)"
+    else:
+        text = f"{mean:.1f}"
+        if len(vals) > 1 and min(vals) != max(vals):
+            text += f" ({min(vals):g}-{max(vals):g})"
+    return text
 
 
-def pct(x):
-    return "n/a" if x != x else f"{x * 100:.0f}%"
+def build_report(set_name, cases, runs) -> str:
+    """`runs` is a list (one entry per repeat) of dict case id -> result."""
+    runs = [r for r in runs if r]
+    n_bug = sum(1 for c in cases if c["kind"] == "bug")
+    n_clean = sum(1 for c in cases if c["kind"] == "clean")
+    all_results = [res for run in runs for res in run.values()]
+    secs = [r["seconds"] for r in all_results]
 
-
-def build_report(results) -> str:
-    n_bug = sum(1 for c in CASES if c["kind"] == "bug" and c["id"] in results)
-    n_clean = sum(1 for c in CASES if c["kind"] == "clean" and c["id"] in results)
-    total_tokens = sum(r["tokens"] for r in results.values())
-    total_calls = sum(r["llm_calls"] for r in results.values())
-    secs = [r["seconds"] for r in results.values()]
-
-    out = ["# PR Sentinel evaluation", ""]
-    out.append(f"Cases scored: {n_bug} buggy files, {n_clean} clean files "
-               f"(line tolerance +/-{LINE_TOLERANCE}).")
+    out = [f"# PR Sentinel evaluation ({set_name})", ""]
+    out.append(f"{n_bug} buggy files, {n_clean} clean files, {len(runs)} run(s) per case "
+               f"(line tolerance +/-{LINE_TOLERANCE}). Ranges show min-max across runs.")
     out.append("")
-    out.append("| Variant | Bugs found | Recall | False positives | Precision | Clean files flagged |")
-    out.append("|---|---|---|---|---|---|")
+    out.append("| Variant | Recall | False positives (per run) | Precision | Clean files flagged |")
+    out.append("|---|---|---|---|---|")
     for name, sel in VARIANTS.items():
-        s = score(results, sel)
-        far, nc = clean_false_alarm_rate(results, sel)
-        out.append(f"| {name} | {s['found']}/{s['bugs']} | {pct(s['recall'])} | "
-                   f"{s['fp']} | {pct(s['precision'])} | {pct(far)} of {nc} |")
+        scores = [score_run(cases, run, sel) for run in runs]
+        flagged = [s["clean_flagged"] / s["clean_total"] for s in scores if s["clean_total"]]
+        out.append(
+            f"| {name} | {fmt_range([s['recall'] for s in scores])} | "
+            f"{fmt_range([s['fp'] for s in scores], as_pct=False)} | "
+            f"{fmt_range([s['precision'] for s in scores])} | {fmt_range(flagged)} |"
+        )
 
-    out += ["", "## Recall by category (full pipeline, verified only)", "",
-            "| Category | Found | Recall |", "|---|---|---|"]
-    sel = VARIANTS["Full pipeline (verified only)"]
-    for cat in sorted({c["category"] for c in CASES if c["kind"] == "bug"}):
-        s = score(results, sel, cat)
-        out.append(f"| {cat} | {s['found']}/{s['bugs']} | {pct(s['recall'])} |")
+    sel = VARIANTS[MAIN_VARIANT]
+    out += ["", f"## Recall by category ({MAIN_VARIANT}, mean over runs)", "",
+            "| Category | Recall |", "|---|---|"]
+    for cat in sorted({c["category"] for c in cases if c["kind"] == "bug"}):
+        scores = [score_run(cases, run, sel, cat) for run in runs]
+        out.append(f"| {cat} | {fmt_range([s['recall'] for s in scores])} |")
 
-    out += ["", "## Cost and speed", ""]
+    if len(runs) > 1:
+        scores = [score_run(cases, run, sel) for run in runs]
+        total = scores[0]["bugs"]
+        in_all = set.intersection(*(s["found_ids"] for s in scores))
+        in_any = set.union(*(s["found_ids"] for s in scores))
+        out += ["", "## Consistency across runs", "",
+                f"- Bugs found in every run: {len(in_all)}/{total}",
+                f"- Bugs found in at least one run: {len(in_any)}/{total}"]
+
+    # Misses: which bugs were not found in the main variant (any run)
+    missed = []
+    for case in cases:
+        if case["kind"] != "bug":
+            continue
+        for run in runs:
+            res = run.get(case["id"])
+            if res is None:
+                continue
+            s = score_run([case], {case["id"]: res}, sel)
+            if s["found"] < s["bugs"]:
+                missed.append(case["id"])
+                break
+    out += ["", "## Bugs missed in at least one run", "",
+            ", ".join(missed) if missed else "none"]
+
+    out += ["", "## Speed", ""]
     if secs:
-        out.append(f"- Mean time per case: {sum(secs) / len(secs):.1f}s "
-                   f"(max {max(secs):.1f}s)")
-    out.append(f"- LLM calls logged: {total_calls}; tokens logged: {total_tokens}")
+        out.append(f"- Mean time per case: {sum(secs) / len(secs):.1f}s (max {max(secs):.1f}s)")
+        out.append(f"- LLM calls logged: {sum(r['llm_calls'] for r in all_results)}")
+        total_usd = sum(r.get("cost_usd", 0) for r in all_results)
+        total_tokens = sum(r.get("tokens", 0) for r in all_results)
+        out.append(f"- Tokens logged: {total_tokens}; estimated cost: ${total_usd:.3f} "
+                   f"(about Rs {total_usd * INR_PER_USD:.0f} at Rs {INR_PER_USD}/USD)")
     out += ["", "## Notes", "",
-            "- Single run per case, so results can vary run to run (LLM output is not deterministic).",
-            "- Small synthetic cases; real-world precision and recall will differ.",
+            "- Synthetic cases written by the author; real-world results will differ.",
+            "- LLM output is not deterministic, hence the repeated runs.",
             "- Style and Pylint findings are not scored."]
     return "\n".join(out) + "\n"
 
@@ -216,45 +265,81 @@ def build_report(results) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--set", default="v1", choices=["v1", "v2", "v3"])
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--report-only", action="store_true")
-    parser.add_argument("--sleep", type=float, default=0.0,
-                        help="seconds to wait between cases")
+    parser.add_argument("--sleep", type=float, default=0.0, help="seconds between cases")
+    parser.add_argument("--only", default="", help="comma-separated case ids to run")
+    parser.add_argument("--tag", default="", help="separate results folder, e.g. --tag min")
+    parser.add_argument("--max-cost-inr", type=float, default=0.0,
+                        help="stop when this run has spent about this many rupees (0 = no limit)")
     args = parser.parse_args()
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    for case in CASES:           # validate all labels before spending money
+    modules = {"v1": "eval.cases", "v2": "eval.cases_v2", "v3": "eval.cases_v3"}
+    cases = importlib.import_module(modules[args.set]).CASES
+    folder = "" if args.set == "v1" else args.set
+    if args.tag:
+        folder = f"{args.set}_{args.tag}"
+    results_dir = BASE_DIR / folder if folder else BASE_DIR
+    cache_dir = results_dir / "cases"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for case in cases:            # validate all labels before spending money
         expected_lines(case)
 
-    results = {}
-    todo = CASES[: args.limit] if args.limit else CASES
-    for case in CASES:
-        cache = CACHE_DIR / f"{case['id']}.json"
-        if cache.exists() and not args.force:
-            cached = json.loads(cache.read_text())
-            if not degraded(cached):
-                results[case["id"]] = cached
+    def cache_path(case, k):
+        suffix = "" if k == 1 else f"__r{k}"
+        return cache_dir / f"{case['id']}{suffix}.json"
+
+    todo = cases[: args.limit] if args.limit else cases
+    if args.only:
+        wanted = {x.strip() for x in args.only.split(",") if x.strip()}
+        unknown = wanted - {c["id"] for c in cases}
+        if unknown:
+            raise SystemExit(f"Unknown case ids: {sorted(unknown)}")
+        todo = [c for c in cases if c["id"] in wanted]
+    spent_inr = 0.0
+    stop = False
+    runs = [dict() for _ in range(args.repeats)]
+
+    for k in range(1, args.repeats + 1):
+        for case in cases:
+            path = cache_path(case, k)
+            if path.exists() and not args.force:
+                cached = json.loads(path.read_text())
+                if not degraded(cached):
+                    runs[k - 1][case["id"]] = cached
 
     if not args.report_only:
-        for case in todo:
-            if case["id"] in results:
-                print(f"[cached] {case['id']}")
-                continue
-            print(f"[run]    {case['id']} ...", flush=True)
-            res = run_case(case)
-            if degraded(res):
-                print(f"         DEGRADED (quota/errors): {res['ai_status']} -- not cached, rerun later")
-                continue
-            (CACHE_DIR / f"{case['id']}.json").write_text(json.dumps(res, indent=2))
-            results[case["id"]] = res
-            if args.sleep:
-                time.sleep(args.sleep)
+        for k in range(1, args.repeats + 1):
+            if stop:
+                break
+            for case in todo:
+                if case["id"] in runs[k - 1]:
+                    print(f"[cached] {case['id']} (run {k})")
+                    continue
+                print(f"[run]    {case['id']} (run {k}) ...", flush=True)
+                res = run_case(case)
+                if degraded(res):
+                    print(f"         DEGRADED (quota/errors): {res['ai_status']} -- not cached, rerun later")
+                    continue
+                cache_path(case, k).write_text(json.dumps(res, indent=2))
+                runs[k - 1][case["id"]] = res
+                spent_inr += res.get("cost_usd", 0) * INR_PER_USD
+                if args.max_cost_inr and spent_inr >= args.max_cost_inr:
+                    print(f"STOPPING: spent about Rs {spent_inr:.0f} this run "
+                          f"(limit Rs {args.max_cost_inr:.0f}). Results so far are cached.")
+                    stop = True
+                    break
+                if args.sleep:
+                    time.sleep(args.sleep)
 
-    report = build_report(results)
-    (RESULTS_DIR / "report.md").write_text(report, encoding="utf-8")
+    report = build_report(args.set, cases, runs)
+    (results_dir / "report.md").write_text(report, encoding="utf-8")
     print("\n" + report)
-    print(f"Saved to {RESULTS_DIR / 'report.md'}")
+    print(f"Saved to {results_dir / 'report.md'}")
 
 
 if __name__ == "__main__":

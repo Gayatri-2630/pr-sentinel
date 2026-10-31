@@ -16,13 +16,19 @@ load_dotenv()
  
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-3.6-flash"
+THINKING_LEVEL = os.getenv("LLM_THINKING_LEVEL", "minimal")  # "default" turns this off
+INPUT_USD_PER_M = 0.75
+OUTPUT_USD_PER_M = 3.75
  
 EMBEDDING_MODEL_NAME = "gemini-embedding-001"
  
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
  
-_client = genai.Client(api_key=GEMINI_API_KEY)
+_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=60_000),
+)
  
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
@@ -73,21 +79,28 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    thinking_config=(
+                        None if THINKING_LEVEL == "default"
+                        else types.ThinkingConfig(thinking_level=THINKING_LEVEL)
+                    ),
                 ),
             )
             latency_ms = int((time.time() - start_time) * 1000)
  
             usage = getattr(response, "usage_metadata", None)
-            input_tokens = getattr(usage, "prompt_token_count", 0) if usage else 0
-            output_tokens = getattr(usage, "candidates_token_count", 0) if usage else 0
- 
+            input_tokens = (getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+            answer_tokens = (getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
+            thought_tokens = (getattr(usage, "thoughts_token_count", 0) or 0) if usage else 0
+            output_tokens = answer_tokens + thought_tokens  # thinking is billed as output
+            cost_usd = (input_tokens * INPUT_USD_PER_M + output_tokens * OUTPUT_USD_PER_M) / 1_000_000
+
             _usage_log.append({
                 "agent_type": agent_type,
                 "model": MODEL_NAME,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "latency_ms": latency_ms,
-                "cost_estimate": 0.0,
+                "cost_estimate": round(cost_usd, 6),
             })
  
             return response.text
@@ -97,8 +110,13 @@ def call_llm(prompt: str, agent_type: str = "unknown") -> str:
             last_error = e
  
             is_quota_429 = "429" in error_message or "RESOURCE_EXHAUSTED" in error_message
-            is_transient_503 = "503" in error_message or "UNAVAILABLE" in error_message
- 
+            is_transient_503 = (
+                "503" in error_message
+                or "UNAVAILABLE" in error_message
+                or "disconnected" in error_message.lower()
+                or "timed out" in error_message.lower()
+                or "timeout" in f"{type(e).__name__}{error_message}".lower()
+            )
             if is_quota_429:
                 if _is_daily_quota_error(error_message):
                     raise LLMQuotaExhaustedError(

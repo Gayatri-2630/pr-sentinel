@@ -27,6 +27,17 @@ Identify likely LOGIC bugs, such as:
 4. An unhandled edge case (e.g. dividing without checking for zero,
    accessing a list/dict without checking it's non-empty).
 5. A loop or recursive call that appears to have no valid exit condition.
+6. Shared mutable state (module-level or global variables) modified from
+   several threads without a lock.
+7. Files, connections or other resources opened without being closed
+   (not using a "with" block or a finally clause).
+8. A truthiness check or "x or default" that wrongly treats valid values
+   such as 0 or an empty string as missing.
+9. Mixing timezone-naive and UTC times (for example utcnow() compared with
+   now()).
+10. An exception handler that swallows an error and then reports success.
+11. A cache key that leaves out a value that distinguishes users or inputs.
+12. A pagination offset or index calculation that is off by one page/item.
 
 Only report something if you can point to a SPECIFIC line and give a
 concrete, plausible reason it's a bug -- do not report vague style
