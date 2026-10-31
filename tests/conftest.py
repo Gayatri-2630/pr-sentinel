@@ -11,6 +11,7 @@ from pathlib import Path
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key-not-real")
 os.environ["GITHUB_WEBHOOK_SECRET"] = "test-webhook-secret"
+os.environ["DASHBOARD_TOKEN"] = "test-dashboard-token"
 
 _db_file = Path(tempfile.gettempdir()) / "pr_sentinel_pytest.db"
 try:
