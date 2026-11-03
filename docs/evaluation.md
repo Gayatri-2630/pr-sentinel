@@ -1,4 +1,5 @@
-
+> **Historical note.** These are results from the first, easy "v1" sanity-check set, run once before cost tracking existed (so token counts read 0). Its cases mirror the wording of the prompts, so the perfect recall here is not a meaningful result, and it is not used for any claim in this project. The held-out results are in [evaluation_v3.md](evaluation_v3.md).
+> 
 # PR Sentinel evaluation
 
 Synthetic test set written by the author (20 seeded bugs, 10 clean files), single run per case. Results will differ on real code.
