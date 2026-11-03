@@ -77,7 +77,7 @@ cp .env.example .env             # then fill in the values below
 uvicorn app.main:app --reload --port 8000
 ```
 
-Values in `.env`: `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID`, the GitHub App private key (see `app/github_auth.py`), `GEMINI_API_KEY`, `DATABASE_URL`, `DASHBOARD_TOKEN`. Optional: `LLM_THINKING_LEVEL` (default `minimal`).
+Copy `.env.example` to `.env` and fill it in. Settings: `DATABASE_URL`, `GITHUB_APP_ID`, `GITHUB_WEBHOOK_SECRET`, the GitHub App private key (`GITHUB_PRIVATE_KEY_PATH` for a `.pem` file, or `GITHUB_PRIVATE_KEY_PEM` for the key itself), `GEMINI_API_KEY`, and `DASHBOARD_TOKEN`. Optional: `LLM_THINKING_LEVEL` (default `minimal`).
 
 GitHub cannot reach `localhost`, so relay webhooks with [smee.io](https://smee.io):
 
